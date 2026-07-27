@@ -1,0 +1,6 @@
+# pack-refs with: peeled fully-peeled sorted 
+9751a72710c4c39ab46fd0608ae001a2325a1953 refs/remotes/origin/Development
+479d6249ab0f89b882da06ed41b02572a16605bd refs/remotes/origin/Migration-RBAC-to-SBA
+fee0509556b98ca736fdf7f3c7dbe80728b1c10f refs/remotes/origin/feature/jvre-rationale
+db80195e66d6a6bd612adefa4ef4d3f488b72be5 refs/remotes/origin/iquest-agenticflow
+68573017ca763599f8e52fdfb18dca36df243146 refs/remotes/origin/main

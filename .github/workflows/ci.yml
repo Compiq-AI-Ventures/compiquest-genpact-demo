@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs for the same branch when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + format + test
+    runs-on: ubuntu-latest
+
+    # PostgreSQL service container — the test fixture builds the schema
+    # against this DB. Credentials match the TEST_DATABASE_URL below.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: compiqcorebe_test
+        ports:
+          - 5432:5432
+        # Block the rest of the job until Postgres is accepting
+        # connections. Without this the first test would race the DB
+        # boot and flake intermittently.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Required by tests/conftest.py — the suite refuses to start if unset.
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/compiqcorebe_test
+      # Stable JWT secret for the test run (validator only refuses
+      # the dev sentinel in production environments).
+      JWT_SECRET_KEY: ci-test-secret-not-for-production-use
+      # Quieter logs in CI; flip to DEBUG when investigating a failure.
+      LOG_LEVEL: WARNING
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Lint with Ruff
+        run: uv run ruff check .
+
+      - name: Format check with Ruff
+        run: uv run ruff format --check .
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov=app --cov-report=term-missing -v

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "genpact-frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "/Users/ajaykumarnishad/compiq_iquest_frontend/compiq-iquest-frontend", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}

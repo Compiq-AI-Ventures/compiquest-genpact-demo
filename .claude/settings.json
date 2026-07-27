@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(psql compiquest-demo *)",
+      "Bash(curl -sS -X POST http://127.0.0.1:8000/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"mom1@oscorp.example.com\",\"password\":\"oscorp-demo-12345\"}')",
+      "Bash(python3 -m json.tool)",
+      "Bash(bash scripts/seed_review_state.sh)",
+      "Bash(uv run python -c ' *)",
+      "Bash(uv run --with openpyxl python -c ' *)",
+      "Bash(uv run *)",
+      "Bash(uv sync *)",
+      "Bash(export TEST_DATABASE_URL=\"postgresql+asyncpg://postgres:postgres@localhost:5432/compiqcorebe_test\")",
+      "Bash(TEST_DATABASE_URL=\"postgresql+asyncpg://localhost:5432/compiqcorebe_test\" uv run pytest tests/test_compchat_report.py tests/test_compchat_pipeline.py -q)",
+      "Bash(TEST_DATABASE_URL=x uv run --with pypdf python -c ' *)",
+      "Bash(TEST_DATABASE_URL=postgresql+asyncpg://localhost/compiqcorebe_test uv run pytest tests/test_compchat_report.py tests/test_compchat_pipeline.py -q)",
+      "Bash(git -C /Users/ajaykumarnishad/Compiq_iquest_backend log --oneline -3 -- app/services/compchat/reporting/)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -)",
+      "Bash(awk '/report|pdf|PDF/{print NR\": \"$0}' /Users/ajaykumarnishad/Compiq_iquest_backend/app/routers/iquest_ai_router.py)",
+      "Bash(awk '{print NR\": \"$0}' /Users/ajaykumarnishad/Compiq_iquest_backend/app/routers/iquest_ai_router.py)",
+      "Bash(git -C /Users/ajaykumarnishad/Compiq_iquest_backend diff HEAD -- app/routers/iquest_ai_router.py)",
+      "Bash(git -C /Users/ajaykumarnishad/Compiq_iquest_backend show HEAD:app/routers/iquest_ai_router.py)",
+      "Bash(git -C /Users/ajaykumarnishad/Compiq_iquest_backend diff HEAD app/routers/iquest_ai_router.py)",
+      "Bash(git -C /Users/ajaykumarnishad/Compiq_iquest_backend status --short app/routers/iquest_ai_router.py)",
+      "Bash(python -c \"import app.routers.iquest_ai_router; print\\('router ok'\\)\")"
+    ]
+  }
+}

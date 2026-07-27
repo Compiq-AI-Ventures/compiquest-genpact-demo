@@ -1,0 +1,13 @@
+Alembic migrations for the CompIQCoreBe project (JVRE backend).
+
+The database URL is loaded by env.py from app.core.config (via the
+DATABASE_URL environment variable / .env file). Do NOT set sqlalchemy.url
+in alembic.ini.
+
+Common commands (run from the project root):
+
+    uv run alembic current                       # show applied revision
+    uv run alembic history                       # show migration history
+    uv run alembic revision --autogenerate -m "msg"  # generate migration
+    uv run alembic upgrade head                  # apply latest
+    uv run alembic downgrade -1                  # revert one step

@@ -6,15 +6,19 @@ ground truth as of the last session.
 
 ## What this project is
 
-**CompIQ** — a multi-tenant compensation planning backend.
+**CompIQ** — a multi-tenant compensation planning backend. This repo
+(`compiq_backend_genpact`) is the **Genpact F&A demo instance** — a
+clone of the original `compiq-iquest-backend` Development branch,
+rebranded and reseeded with real Genpact F&A data. The original
+Oscorp/Spider-Man demo tenant and its seed scripts have been removed;
+`genpact` is the only tenant this repo seeds.
 
-- **Backend repo (this one):** `Caludetry` — FastAPI + SQLAlchemy 2.x
-  async + PostgreSQL (with one RLS-enabled table as a template) + Redis
-  (JWT deny-list, with in-memory fallback for dev).
-- **Frontend repo (sibling):** `Caludetry-frontend` — Vite + React 19 +
+- **Backend (this repo):** FastAPI + SQLAlchemy 2.x async + PostgreSQL
+  (with one RLS-enabled table as a template) + Redis (JWT deny-list,
+  with in-memory fallback for dev).
+- **Frontend (sibling):** `compiq_iquest_frontend` — Vite + React 19 +
   TypeScript + TanStack Query + React Router + Zustand + Tailwind +
-  Radix primitives. **Functional only** — built for API exploration, NOT
-  pixel-perfect to the locked design. Not the demo asset.
+  Radix primitives, branch `cxos_dashboard`.
 
 ## State of v0.1
 
@@ -56,12 +60,15 @@ Standard backend boot:
 
 ```bash
 uv sync
-createdb compiqcorebe_db && createdb compiqcorebe_test
+createdb compiquest_genpact_demo
 cp .env.example .env  # then edit DATABASE_URL, JWT_SECRET, REDIS_URL, CORS_ALLOW_ORIGINS
 uv run alembic upgrade head
-uv run python -m scripts.seed_demo_tenant
+uv run python -m scripts.seed_genpact_master_data   # once: genpact_* analytics tables from the workbook
+uv run python -m scripts.seed_genpact_tenant        # transactional tenant: users/roles/cycles/budgets/JVRE
 uv run uvicorn app.main:app --reload   # http://127.0.0.1:8000  /docs for Swagger
 ```
+
+Or just `./scripts/reset_demo.sh` to run both seed steps idempotently.
 
 Super-admin bootstrap (one-shot, idempotent):
 
@@ -81,26 +88,34 @@ See `README.md` for full setup + architecture notes.
 | `docs/walkthroughs/mom_budget_iterative*.md` | MoM Budget Allocation walks (bash / PowerShell / curl / Swagger) |
 | `docs/walkthroughs/mop_pay_recommendations*.md` | MoP Pay Recommendation walks (same four flavors + Mermaid diagrams) |
 | `docs/walkthroughs/mom_pay_review*.md` | MoM Pay Review walks (same four flavors) |
-| `scripts/reset_demo.sh` | Drop + reseed oscorp (idempotent, fixed RNG) |
-| `scripts/seed_review_state.sh` | Reset + drive Otto's submit + Eddie's submit (state ready for MoM Pay Review) |
-| `scripts/seed_demo_tenant.py` | The actual seed logic |
+| `scripts/reset_demo.sh` | Drop + reseed the Genpact tenant (idempotent) |
+| `scripts/seed_genpact_master_data.py` | Loads `genpact_*` analytics tables from `data/Genpact_FA_Synthetic_Employee_Dataset.xlsx` |
+| `scripts/seed_genpact_tenant.py` | The transactional seed logic (users, roles, cycles, budgets, JVRE snapshots) from `data/JVRE_output.xlsx` |
 | `README.md` | Dev setup + architecture overview |
 
 The **bash** walkthrough flavor is canonical; PowerShell / curl / Swagger
 are translations. PowerShell is now legacy (was for Windows) — user is
-on Mac.
+on Mac. Note the walkthrough docs under `docs/walkthroughs/` still
+reference the old Oscorp personas/emails — translate persona names
+mentally to the Genpact equivalents below; the API contract itself is
+unchanged.
 
-## Demo personas (oscorp tenant, password `oscorp-demo-12345`)
+## Demo personas (genpact tenant, password `genpact-demo-12345`)
 
-| Email | Persona | Role | What they see |
-|---|---|---|---|
-| `cfo@oscorp.example.com` | Norman Osborn | CFO | Root allocation pre-submitted; workspace UI lands in v0.2 |
-| `chro@oscorp.example.com` | Liz Allan | CHRO | Read-only; workspace UI lands in v0.2 |
-| `mom1@oscorp.example.com` … `mom4@` | Otto Octavius, Curt Connors, Quentin Beck, Adrian Toomes | MANAGER_OF_MANAGERS | Budget Allocation + Pay Review |
-| `mop1-1@oscorp.example.com` … `mop4-4@` | 16 named villains/antiheroes | MANAGER (MoP) | Pay Recommendations |
+28,413 FY2026 employees seeded from real org data. Emails are
+`first.last[.empidsuffix]@genpact.com`.
 
-ICs (88 of them) are seeded but don't have a self-service workspace in
-v0.1 — only show up as subjects in MoP/MoM screens.
+| Role | Example | Notes |
+|---|---|---|
+| CFO | `rohan.agarwal@genpact.com` | Root allocation pre-submitted |
+| CHRO | `siddharth.verma@genpact.com` | Read-only; workspace UI lands in v0.2 |
+| C&B | `anna.wojcik@genpact.com` | |
+| MANAGER_OF_MANAGERS | `sarah.smith.33395@genpact.com` (11 direct reports) | Budget Allocation + Pay Review |
+| PNL_HEAD (dedicated demo login) | `<name>.pnlhead@genpact.com`, one per BU | Combined PnL + MoM sidebar |
+| MANAGER / IC | (assigned by management span) | Pay Recommendations / subjects only |
+
+See `memory` (genpact-demo-setup) for the full setup history — currency
+handling (USD reporting), P&L Head role, iQuest AI wiring, etc.
 
 ## Database — quick map (17 tables)
 
@@ -137,9 +152,9 @@ api() {
 
 compiq-login() {
     local localpart=${1:?usage: compiq-login <localpart>}
-    local email="${localpart}@oscorp.example.com"
+    local email="${localpart}@genpact.com"
     local resp
-    resp=$(curl -sS -X POST "${COMPIQ_API}/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$email\",\"password\":\"oscorp-demo-12345\"}")
+    resp=$(curl -sS -X POST "${COMPIQ_API}/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$email\",\"password\":\"genpact-demo-12345\"}")
     export TOKEN=$(echo "$resp" | jq -r '.data.access_token // empty')
     [[ -z $TOKEN ]] && { echo "login failed: $resp" >&2; return 1; }
     export CYCLE_ID=$(api GET /comp-cycles/active | jq -r '.data.id // empty')
@@ -149,24 +164,7 @@ compiq-login() {
 }
 ```
 
-A typical session becomes `compiq-login mom1` then `api GET /comp-cycles/$CYCLE_ID/my-budget-allocation | jq .data`.
-
-## Open thread (likely still unresolved)
-
-The user's first `compiq-login mom1` on Mac succeeded in getting a TOKEN
-but the secondary `api GET /comp-cycles/active` call inside the function
-errored with `api:3: command not found: curl`. The login curl itself
-worked (TOKEN was returned), so curl is on PATH — almost certainly the
-function body got mangled when pasted (smart quotes from chat client, or
-line-continuation backslash dropped). Diagnosis steps suggested but not
-yet executed by the user:
-
-1. `which curl` — confirm PATH
-2. `functions api` — inspect what zsh actually parsed
-3. Re-paste a single-line-curl version of the function (shown in chat)
-
-When the user starts the Mac Claude session, this is probably what
-they'll resume from. Confirm it's fixed before diving into walkthroughs.
+A typical session becomes `compiq-login sarah.smith.33395` then `api GET /comp-cycles/$CYCLE_ID/my-budget-allocation | jq .data`.
 
 ## Known gotchas to flag during walks
 
@@ -185,9 +183,13 @@ These have tripped the user before — call them out proactively:
   once a rec is submitted, the actor (MoP) can't re-edit. `REVISED` is
   the reviewer's iteration marker, not a hand-off back to actor.
 - **The seed pre-submits the CFO's allocation** so MoMs have funded
-  pools. MoP/Review walks have their own prereq: run
-  `./scripts/seed_review_state.sh` to also drive Otto's submit + Eddie's
-  submit in one shot.
+  pools. There is no scripted "drive to review-ready" helper for Genpact
+  (the old `seed_review_state.sh` was Oscorp-specific and removed) — walk
+  a MoM's submit + a MoP's submit manually via the API if you need
+  review-ready state.
+- **`align-with-jvre` is destructive for Genpact's 22,700 seeded
+  snapshots too** — same warning applies at scale, be careful re-running
+  it against a manager with a large subtree.
 
 ## Backlog (for context, not to act on)
 

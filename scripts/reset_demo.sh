@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# reset_demo.sh — One-shot helper that drops + reseeds the Oscorp demo tenant.
+# reset_demo.sh — One-shot helper that drops + reseeds the Genpact demo tenant.
 #
-# Use this between recording takes (or any time you've mutated state via
-# Walk A / Walk B / the React frontend / curl and want a clean slate):
+# Use this any time you've mutated state via the API / frontend and want a
+# clean slate:
 #
 #   ./scripts/reset_demo.sh
 #
 # Equivalent to:
-#   uv run python -m scripts.seed_demo_tenant
+#   uv run python -m scripts.seed_genpact_master_data
+#   uv run python -m scripts.seed_genpact_tenant
 # but doesn't require you to be in the repo root or remember the module path.
 #
-# Idempotent. Uses a fixed RNG seed, so the same Spider-Man characters land
-# in the same roles every time.
+# Idempotent. The genpact_* analytics tables (master data) are only rebuilt
+# by seed_genpact_master_data; seed_genpact_tenant rebuilds the transactional
+# tenant (users, roles, cycles, budget allocations, JVRE snapshots, ...) on
+# top of them.
 
 set -euo pipefail
 
@@ -26,17 +29,9 @@ if [ -f "$REPO_ROOT/.env" ] && [ -z "${DATABASE_URL:-}" ]; then
     DATABASE_URL=$(grep -E '^DATABASE_URL=' "$REPO_ROOT/.env" | cut -d= -f2-)
 fi
 
-echo "→ Reseeding Oscorp demo tenant from $REPO_ROOT"
-uv run python -m scripts.seed_demo_tenant "$@"
-
-# Post-seed enrichment scripts (added with the manager-dashboard work).
-# Each looks up the demo tenant by code, so they only work after
-# seed_demo_tenant has run — chained here so the demo flow stays
-# one-command.
-echo ""
-echo "→ Linking users to departments"
-uv run python -m scripts.seed_departments
+echo "→ Reseeding Genpact master data (genpact_* analytics tables)"
+uv run python -m scripts.seed_genpact_master_data
 
 echo ""
-echo "→ Setting job titles on users"
-uv run python -m scripts.seed_job_titles
+echo "→ Reseeding Genpact demo tenant (users, roles, cycles, budgets, JVRE)"
+uv run python -m scripts.seed_genpact_tenant "$@"

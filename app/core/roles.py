@@ -57,6 +57,7 @@ class RoleCode(StrEnum):
     HR = "HR"
     HRBP = "HRBP"
     C_AND_B = "C_AND_B"
+    PNL_HEAD = "PNL_HEAD"
     MANAGER_OF_MANAGERS = "MANAGER_OF_MANAGERS"
     MANAGER = "MANAGER"
     IC = "IC"
@@ -83,6 +84,7 @@ TENANT_ROLES: frozenset[str] = frozenset(
         RoleCode.HR,
         RoleCode.HRBP,
         RoleCode.C_AND_B,
+        RoleCode.PNL_HEAD,
         RoleCode.MANAGER_OF_MANAGERS,
         RoleCode.MANAGER,
         RoleCode.IC,
@@ -161,6 +163,13 @@ DEFAULT_ROLES: tuple[tuple[str, str, str, str], ...] = (
         RoleCode.C_AND_B.value,
         "Compensation & Benefits",
         "Owns pay structure, benefits design, and benchmarking.",
+        RoleScope.TENANT.value,
+    ),
+    (
+        RoleCode.PNL_HEAD.value,
+        "P&L Head",
+        "Business-unit P&L owner; accountable for a BU's cost, headcount, "
+        "and compensation outcomes end to end.",
         RoleScope.TENANT.value,
     ),
     (

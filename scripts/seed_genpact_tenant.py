@@ -435,6 +435,96 @@ async def main() -> None:
             await _bulk(db, UserRole.__table__, exec_grants)
         print(f"  exec grants: CFO={cfo_eid} (+CHRO,C&B) from {len(roots)} roots")
 
+        # --- P&L Head (BU Head): one per business unit -----------------
+        # A P&L Head is a real business-unit leader, not a title we invent:
+        # among each BU's most-senior tier (job_level '1'), we grant the
+        # role to whoever owns the LARGEST actual reporting subtree in that
+        # BU — i.e. the person whose org actually is the business unit,
+        # not just the first level-1 row alphabetically. This is an
+        # additional role (kept alongside their base MANAGER_OF_MANAGERS
+        # grant from role_for()), mirroring how CFO/CHRO/C&B are layered
+        # on top of the base role.
+        directs_of_active: dict[str, list[str]] = {}
+        for r in fy2026:
+            m = r["manager_employee_id"]
+            if m in emp and r["status"] == "ACTIVE":
+                directs_of_active.setdefault(m, []).append(r["employee_id"])
+
+        def _subtree_size(root_eid: str) -> int:
+            seen: set[str] = set()
+            stack = list(directs_of_active.get(root_eid, []))
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                stack.extend(directs_of_active.get(node, []))
+            return len(seen)
+
+        level1_by_bu: dict[str, list[str]] = {}
+        for r in fy2026:
+            if r["status"] == "ACTIVE" and r["job_level"] == "1":
+                level1_by_bu.setdefault(r["business_unit"], []).append(r["employee_id"])
+
+        # Real BU heads deliberately get NO role_rows change here — their
+        # original login (e.g. sarah.smith.33395@genpact.com) stays exactly
+        # what role_for() already gave it (MANAGER_OF_MANAGERS) and nothing
+        # else, so it keeps showing ONLY the MoM experience end to end.
+        pnl_heads: dict[str, str] = {}
+        for bu, candidates in level1_by_bu.items():
+            best_eid = max(candidates, key=_subtree_size, default=None)
+            if best_eid is None or _subtree_size(best_eid) == 0:
+                continue  # no one in this BU actually heads a real org
+            pnl_heads[bu] = best_eid
+        print(f"  P&L Head identified per BU: {dict(list(pnl_heads.items())[:6])}")
+
+        # --- Dedicated P&L Head demo logins (PNL_HEAD + MANAGER_OF_MANAGERS) --
+        # One login per BU, separate from the real head's own account, that
+        # holds BOTH roles — this is the account that exercises the combined
+        # PnL + MoM experience (Dashboard -> PnL, "Pay Recommendation
+        # Dashboard" -> MoM, plus the usual MoM nav sections). Identity
+        # (name, title, department) is copied from the real BU head row, so
+        # the account still represents real org data — it's a second login
+        # for the same leadership seat, not a fabricated person.
+        pnl_demo_rows, pnl_demo_roles = [], []
+        demo_uid_by_head_eid: dict[str, uuid.UUID] = {}
+        for bu, head_eid in pnl_heads.items():
+            head = emp[head_eid]
+            first, last = _split_name(head["employee_name"])
+            demo_uid = uuid.uuid4()
+            demo_uid_by_head_eid[head_eid] = demo_uid
+            slug = _slug(f"{first}.{last}") or head_eid.lower()
+            pnl_demo_rows.append(
+                {
+                    "id": demo_uid,
+                    "tenant_id": tid,
+                    "email": f"{slug}.pnlhead@genpact.com"[:255],
+                    "password_hash": shared_hash,
+                    "first_name": first[:100],
+                    "last_name": (last or None),
+                    "job_title": f"P&L Head — {bu}",
+                    "department_id": dept_id.get(bu),
+                    "is_active": True,
+                }
+            )
+            pnl_demo_roles.append(
+                {"id": uuid.uuid4(), "user_id": demo_uid, "role_id": roles["PNL_HEAD"]}
+            )
+            pnl_demo_roles.append(
+                {
+                    "id": uuid.uuid4(),
+                    "user_id": demo_uid,
+                    "role_id": roles["MANAGER_OF_MANAGERS"],
+                }
+            )
+        if pnl_demo_rows:
+            await _bulk(db, User.__table__, pnl_demo_rows)
+            await _bulk(db, UserRole.__table__, pnl_demo_roles)
+        print(
+            f"  P&L Head demo logins (PNL_HEAD + MANAGER_OF_MANAGERS): {len(pnl_demo_rows)} "
+            f"({', '.join(r['email'] for r in pnl_demo_rows)})"
+        )
+
         # --- compensation cycles -------------------------------------------
         cfo_uid = uid[cfo_eid]
         cycle_ids = {}
@@ -478,6 +568,13 @@ async def main() -> None:
         ]
         await _bulk(db, ReportingRelationship.__table__, rr_rows)
         print(f"  {len(rr_rows):,} reporting edges")
+        # NOTE: reporting_relationships enforces one manager per (cycle,
+        # report) — a report cannot have two managers in the same cycle —
+        # so the P&L Head demo logins do NOT get mirrored reporting edges.
+        # Their Team-Pay "my direct reports" list is legitimately empty;
+        # their Budget Planner / Distribute-Budget screens are still fully
+        # populated via the cloned BudgetAllocation + lines in _seed_budget
+        # (those read budget_allocation_lines, not reporting_relationships).
 
         # --- compensation history (FY2023-2025) ----------------------------
         print("Reading prior-year rows for compensation history…")
@@ -820,6 +917,7 @@ async def main() -> None:
             emp=emp,
             fy2026=fy2026,
             mb_by_eid={r["employee_id"]: r for r in fy2026},
+            demo_uid_by_head_eid=demo_uid_by_head_eid,
         )
 
         await db.commit()
@@ -829,7 +927,9 @@ async def main() -> None:
     print(f"  Password     : {DEMO_PASSWORD} (every user)")
 
 
-async def _seed_budget(db, *, tid, active_cid, cfo_eid, uid, emp, fy2026, mb_by_eid) -> None:
+async def _seed_budget(
+    db, *, tid, active_cid, cfo_eid, uid, emp, fy2026, mb_by_eid, demo_uid_by_head_eid=None
+) -> None:
     """One budget allocation per manager, wired into the reporting cascade.
 
     Every manager (anyone with ≥1 direct report) owns a BudgetAllocation for
@@ -989,8 +1089,38 @@ async def _seed_budget(db, *, tid, active_cid, cfo_eid, uid, emp, fy2026, mb_by_
     await _bulk(db, BudgetAllocationLine.__table__, line_rows)
     print(
         f"  budget: {len(alloc_rows):,} manager allocations + {len(line_rows):,} lines "
-        f"(subtree-based, INR-converted; CFO root SUBMITTED)"
+        f"(subtree-based, USD-converted; CFO root SUBMITTED)"
     )
+
+    # --- Clone each real BU head's own allocation + lines onto their
+    # dedicated PNL_HEAD+MANAGER_OF_MANAGERS demo login. Additive only: the
+    # real head's own row (inserted above, owner_user_id=uid[head_eid]) is
+    # untouched, so that login's Budget Planner is unaffected. The clone
+    # gives the demo login a real, populated Budget Planner/Team-Pay screen
+    # instead of an empty one — same pool, same reserve, same per-report
+    # lines, just a different owner and a fresh set of row ids. Inserted
+    # AFTER the real rows above so ``parent_allocation_id`` (copied from the
+    # real head's row, e.g. pointing at the CFO's allocation) always
+    # references a row that already exists.
+    demo_alloc_rows, demo_line_rows = [], []
+    for head_eid, demo_uid in (demo_uid_by_head_eid or {}).items():
+        head_aid = alloc_id_of.get(head_eid)
+        if head_aid is None:
+            continue
+        head_alloc = next(a for a in alloc_rows if a["id"] == head_aid)
+        demo_aid = uuid.uuid4()
+        demo_alloc_rows.append({**head_alloc, "id": demo_aid, "owner_user_id": demo_uid})
+        for line in line_rows:
+            if line["allocation_id"] != head_aid:
+                continue
+            demo_line_rows.append({**line, "id": uuid.uuid4(), "allocation_id": demo_aid})
+    if demo_alloc_rows:
+        await _bulk(db, BudgetAllocation.__table__, demo_alloc_rows)
+        await _bulk(db, BudgetAllocationLine.__table__, demo_line_rows)
+        print(
+            f"  budget (P&L Head demo logins): {len(demo_alloc_rows)} cloned allocations "
+            f"+ {len(demo_line_rows)} cloned lines"
+        )
 
 
 if __name__ == "__main__":

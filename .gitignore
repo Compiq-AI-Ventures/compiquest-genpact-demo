@@ -75,6 +75,9 @@ docs/
 !docs/specs/
 !docs/specs/**
 
+*.md
+*.xlsx
+
 # Load-test CSV output. Commit only the canonical baseline (see
 # loadtest/README.md); the rest are run-local noise.
 loadtest/results/

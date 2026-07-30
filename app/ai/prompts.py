@@ -7,6 +7,7 @@ Both iquest_ai_router and iquest_streaming_service import from here.
 from __future__ import annotations
 
 import pathlib
+import re
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,49 @@ def _pct_from_bases(current: object, new: object) -> str:
     except (TypeError, ValueError):
         pass
     return "N/A"
+
+
+# Local/small models (Ollama) don't reliably follow "keep your reasoning
+# silent" — they sometimes print the ReAct scaffold itself (e.g.
+# "## Answer ... ## Reasoning (internal only) *Reason:* ... *Act:* ...").
+# This is a deterministic server-side safety net: strip any leaked scaffold
+# so only the final answer ever reaches the user, regardless of whether the
+# model complied with the prompt.
+_ANSWER_HEADING_RE = re.compile(r"##\s*Answer\s*:?\s*(.*?)(?=##\s*Reasoning|\Z)", re.IGNORECASE | re.DOTALL)
+_INLINE_ANSWER_RE = re.compile(r"\*\s*Answer\s*:\s*\*?", re.IGNORECASE)
+_REASONING_HEADING_RE = re.compile(r"##\s*Reasoning.*", re.IGNORECASE | re.DOTALL)
+
+
+def strip_react_scaffold(text: str) -> str:
+    """Remove a leaked ReAct scaffold from an LLM response, if present.
+
+    Handles two leak shapes seen from local models:
+    1. ``## Answer <text> ## Reasoning (internal only) ...`` — keep only the
+       text between the Answer heading and the Reasoning heading.
+    2. Inline ``*Reason:* ... *Act:* ... *Observe:* ... *Answer:* "<text>"``
+       — keep only the text after the last ``*Answer:*`` marker.
+
+    Returns the input unchanged if no scaffold markers are found.
+    """
+    original = text.strip()
+    cleaned = original
+
+    m = _ANSWER_HEADING_RE.search(cleaned)
+    if m and m.group(1).strip():
+        cleaned = m.group(1).strip()
+
+    parts = _INLINE_ANSWER_RE.split(cleaned)
+    if len(parts) > 1 and parts[-1].strip():
+        cleaned = parts[-1].strip()
+
+    # Defensive: drop any residual reasoning tail that survived the above.
+    cleaned = _REASONING_HEADING_RE.sub("", cleaned).strip()
+
+    # The scaffold often wraps the final answer in a quote pair — unwrap it.
+    if len(cleaned) >= 2 and cleaned[0] == '"' and cleaned[-1] == '"':
+        cleaned = cleaned[1:-1].strip()
+
+    return cleaned or original
 
 
 # Concise Finance & Accounting domain primer for the *rationale* generator.
@@ -98,6 +142,28 @@ OUTPUT FORMAT — follow every rule exactly:
 - Never end abruptly.\
 """
 
+GLOBAL_OVERVIEW_SYSTEM = """\
+You are iQuest AI, a compensation planning advisor. Write a concise, plain-language \
+org-wide compensation cycle overview for a senior leader (CFO, CHRO, or HR) opening \
+the cycle dashboard.
+
+OUTPUT FORMAT — follow every rule exactly:
+- Begin immediately with the first sentence. Do NOT output a title, heading, label, or blank line first.
+- Write in natural paragraph form only. No section headers, bullets, or tables.
+- Use 2-3 short paragraphs separated by a single blank line.
+- Each paragraph: 2-3 sentences.
+- Total length: 90-150 words maximum.
+- Bold only 1-3 key figures (submission progress, budget utilisation, or the most
+  urgent cycle-wide item).
+- Use exact currency values and counts only when they add clarity.
+- Do not show calculations or formulas.
+- Never disclose individual employee compensation details — this is aggregate-only.
+- Never invent a deadline, date, or target you were not given in the data below.
+- End with a complete, forward-looking sentence about what the leader should focus on next,
+  phrased without a specific date unless one appears in the data.
+- Never end abruptly.\
+"""
+
 
 # ---------------------------------------------------------------------------
 # Chat system prompt builders (BUDGET / GLOBAL Q&A)
@@ -128,7 +194,12 @@ def build_scope_chat_system_prompt(scope: str, context_block: str) -> str:
         "knowledge base: work out what is asked and which facts you need, locate them in "
         "the data below, check they answer the question (say so if a fact is missing), then "
         "give only the final answer. Every number must come from the data below; never invent "
-        "or recompute figures."
+        "or recompute figures.\n\n"
+        "CRITICAL OUTPUT RULE: your entire response is shown directly to the user as-is. "
+        "Do NOT include the words 'Reason', 'Act', 'Observe', 'Answer', or 'Reasoning' anywhere "
+        "in your output. Do NOT use markdown headings (##) or asterisk-labelled steps "
+        "(e.g. '*Reason:*'). Do NOT show your work. Output ONLY the final answer as plain "
+        "prose sentences — nothing before it, nothing after it."
     )
     return f"{IQUEST_CONTEXT}\n\n{role_desc}\n\n{react}\n\n---\n\n{context_block}"
 
@@ -211,3 +282,32 @@ def build_pay_questions_prompt(eng: Any, rationale_text: str = "") -> str:
         'Example: ["Question 1?", "Question 2?", "Question 3?", "Question 4?"]\n\n'
     )
     return IQUEST_CONTEXT + "\n\n---\n\n" + task + data_block
+
+
+def build_pnl_bullets_prompt(pre_formatted_facts: dict[str, str]) -> str:
+    """Full LLM prompt for the P&L Head Executive Summary's 5 narrative bullets.
+
+    ``pre_formatted_facts`` values are already-rounded display strings (e.g.
+    "$660.6M", "20.1%") computed by the caller — the model's only job is to
+    weave them into prose, never to compute, round, or invent a number.
+    """
+    facts_block = "\n".join(f"- {label}: {value}" for label, value in pre_formatted_facts.items())
+    task = (
+        "TASK: Write exactly 5 short executive-summary bullet sentences for a P&L Head "
+        "dashboard, using ONLY the facts listed below.\n\n"
+        "NUMERIC AUTHORITY — the single most important rule: every number, percentage, or "
+        "dollar figure you write MUST be copied character-for-character from the facts list "
+        "below. Never round, recompute, combine, or invent a number that isn't already there "
+        "verbatim. If a fact isn't in the list, don't mention it.\n\n"
+        "STYLE:\n"
+        "- Plain, direct, board-level business language — no jargon, no bullet markers, no "
+        "headings, just the sentence text.\n"
+        "- Each bullet is 1-2 sentences, standalone (a reader sees only that bullet).\n"
+        "- Vary sentence structure across the 5 bullets — don't repeat the same phrasing pattern.\n"
+        "- The final bullet should be a forward-looking one-sentence call to action for next "
+        "fiscal year, not a fact recap.\n\n"
+        f"FACTS (only source of numbers):\n{facts_block}\n\n"
+        "Return ONLY a JSON array of exactly 5 strings. No explanation, no markdown, no preamble.\n"
+        'Example: ["Bullet 1.", "Bullet 2.", "Bullet 3.", "Bullet 4.", "Bullet 5."]'
+    )
+    return task

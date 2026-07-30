@@ -31,6 +31,7 @@ from app.routers import (
     department_router,
     iquest_ai_router,
     jvre_workspace_router,
+    pnl_dashboard_router,
     tenant_router,
 )
 
@@ -89,6 +90,9 @@ app.include_router(jvre_workspace_router.user_reference_router)
 
 # iQuest AI — suggested questions + Q&A streaming
 app.include_router(iquest_ai_router.router)
+
+# P&L Head — org-wide Executive Summary dashboard
+app.include_router(pnl_dashboard_router.router)
 
 
 @app.get("/")

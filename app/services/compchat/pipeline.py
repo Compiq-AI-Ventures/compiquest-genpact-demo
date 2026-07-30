@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.prompts import strip_react_scaffold
 from app.core.config import Settings
 from app.dependencies.tenant_dependency import TenantContext
 from app.services import audit_log_service
@@ -388,7 +389,10 @@ async def narrate(
         await _audit(db, ctx, result)
         return
 
-    answer = "".join(buffer_parts).strip()
+    # Local SLMs don't always keep the ReAct scratchpad silent — strip any
+    # leaked "## Answer / ## Reasoning" or "*Reason:* ... *Answer:*" scaffold
+    # before it's validated or shown to the manager.
+    answer = strip_react_scaffold("".join(buffer_parts).strip())
     # Ground against the context AND the rationale: the rationale is shown
     # verbatim to the manager, so the numbers it states are legitimate
     # grounding sources for follow-up questions about the recommendation.

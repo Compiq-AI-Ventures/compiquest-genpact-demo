@@ -94,6 +94,26 @@ async def _load_engine_output(
     return eng
 
 
+async def _buffered_sse_stream(token_stream, chunk_size: int = 24):
+    """Buffer a raw token stream fully, strip any leaked ReAct scaffold, then
+    re-emit as SSE ``data:`` frames.
+
+    Local SLMs don't reliably keep the ReAct scratchpad silent — a raw
+    token-by-token pass-through would print a leaked "## Answer / ##
+    Reasoning" scaffold live as it generates, and by the time it's visible
+    there's no way to retract it. Buffering trades a small delay before the
+    first frame for a guarantee that only the clean final answer is ever
+    shown, still re-chunked so the UI gets its typewriter effect.
+    """
+    buffer_parts: list[str] = []
+    async for token in token_stream:
+        buffer_parts.append(token)
+    answer = prompts.strip_react_scaffold("".join(buffer_parts).strip())
+    for i in range(0, len(answer), chunk_size):
+        yield f"data: {json.dumps({'token': answer[i : i + chunk_size]})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def _parse_questions_from_llm(raw: str) -> list[str]:
     """Parse a JSON array of question strings from a raw LLM response.
 
@@ -152,13 +172,51 @@ async def stream_budget_rationale(
 
     token_stream = stream_scope_response(settings, full_prompt)
 
-    async def event_stream():
-        async for token in token_stream:
-            yield f"data: {json.dumps({'token': token})}\n\n"
-        yield "data: [DONE]\n\n"
+    return StreamingResponse(
+        _buffered_sse_stream(token_stream),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Endpoint 1b: GLOBAL cycle overview stream (SSE)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/global-rationale/{cycle_id}",
+    summary="Stream an org-wide cycle overview narrative (SSE)",
+    responses={
+        401: {"description": "Missing or invalid Bearer token"},
+    },
+)
+async def stream_global_rationale(
+    cycle_id: uuid.UUID,
+    ctx: TenantContext = Depends(get_tenant_context),
+    db: AsyncSession = Depends(get_tenant_scoped_db),
+) -> StreamingResponse:
+    """Auto-generated "Cycle Overview" card for the GLOBAL-scope iQuest panel —
+    the aggregate-only counterpart to budget/pay rationale, for CFO/CHRO/HR
+    users opening the assistant from the navbar (no specific subject/manager)."""
+    settings = get_settings()
+    context_block = await build_global_context(db, ctx.active_tenant_id, cycle_id)
+
+    full_prompt = (
+        prompts.GLOBAL_OVERVIEW_SYSTEM
+        + "\n\n---\n\n"
+        + context_block
+        + "\n\nWrite the cycle overview:"
+    )
+
+    token_stream = stream_scope_response(settings, full_prompt)
 
     return StreamingResponse(
-        event_stream(),
+        _buffered_sse_stream(token_stream),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -355,13 +413,8 @@ async def iquest_query_stream(
 
         token_stream = stream_scope_response(settings, full_prompt)
 
-        async def scope_event_stream():
-            async for token in token_stream:
-                yield f"data: {json.dumps({'token': token})}\n\n"
-            yield "data: [DONE]\n\n"
-
         return StreamingResponse(
-            scope_event_stream(),
+            _buffered_sse_stream(token_stream),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

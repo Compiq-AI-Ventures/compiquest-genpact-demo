@@ -70,6 +70,20 @@ uv run uvicorn app.main:app --reload   # http://127.0.0.1:8000  /docs for Swagge
 
 Or just `./scripts/reset_demo.sh` to run both seed steps idempotently.
 
+**Before handing this off or debugging a "login doesn't work"** report, run the
+checkpoint script — it checks Postgres connectivity, migration state, tenant/
+roles, master-data + tenant seed row counts, and (with `--api`) actually logs
+in as one demo user per role against a live backend:
+
+```bash
+uv run python -m scripts.verify_setup --api http://127.0.0.1:8000
+```
+
+Every check prints PASS/FAIL with the exact command to fix it — share the
+full output rather than re-describing the symptom. A teammate with a fresh
+clone should run this after `alembic upgrade head` + both seed scripts and
+get all-green before assuming the environment is broken.
+
 Super-admin bootstrap (one-shot, idempotent):
 
 ```bash

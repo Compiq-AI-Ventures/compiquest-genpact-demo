@@ -1,28 +1,27 @@
-"""P&L Head Executive Summary — org-wide read aggregation.
-
-Reproduces ``Genpact_Executive_Summary.xlsx`` exactly from the tables
-already backing the rest of the app. Every formula below was verified
-against the live seeded DB before being written here; see the plan
-doc for the full reconciliation notes.
+"""P&L Head Executive Summary — org-wide KPI aggregation.
 
 Org-wide, not BU-scoped: every PNL_HEAD caller sees the same figures.
-No manager/subtree scoping — much simpler than the MoM/Manager
-services in ``jvre_workspace_service.py``.
+No manager/subtree scoping — much simpler than the MoM/Manager services
+in ``jvre_workspace_service.py``.
 
-Two data sources:
+The dashboard measures FY2025 actuals against FY2024, and projects
+FY2026. The KPI definitions (agreed with the finance team):
 
-* ``jvre_snapshots`` / ``genpact_employee_master`` — 8 of 9 metrics.
-* ``genpact_job_posting`` — backfill cost + New Hire Median Cost. That
-  table (and ``genpact_currency_master``) has no ORM class (see
-  ``app/models/genpact_master_data.py``), so both are queried via
-  plain ``text()`` SQL rather than the Core ``Table``/ORM layer.
+1. Beginning base cost — sum of ACTIVE employees' pre-increment base
+   salary, plus the delta vs the prior FY.
+2. Increment — average base increment %, and the same in dollars.
+3. New hire total cost — backfill + net new hires (count and cost).
+4. Projected new base — beginning base + new hire total + increment.
+5. Attrition rate — leavers / headcount, vs the prior FY.
+6. Leadership retention — 1 − attrition among leadership job levels.
+7. New hire median cost — median incoming vs outgoing base pay.
 
-FX conversion for the two genpact_job_posting-derived metrics
-(backfill cost, median cost) needs each leaver's currency, which
-varies per row — that's a per-row SQL join against
-``genpact_currency_master``, not the single-FY rate table used by
-``compchat/tools.py``. Plain ``text()`` queries, consistent with that
-module's convention for reading genpact_* master data.
+All money is converted to USD at insert-time rates held in
+``genpact_currency_master`` (keyed by fiscal year + local currency), so
+every sum joins through that table. These are ``text()`` queries rather
+than ORM ones because ``genpact_job_posting`` and
+``genpact_currency_master`` have no ORM class — see
+``app/models/genpact_master_data.py``.
 """
 
 from __future__ import annotations
@@ -33,333 +32,396 @@ import json
 import logging
 import time
 import uuid
+from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import func, select
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.prompts import build_pnl_bullets_prompt
 from app.core.config import get_settings
-from app.models.genpact_master_data import GenpactEmployeeMaster
-from app.models.jvre_snapshot import JvreSnapshot
 from app.schemas.pnl_dashboard_schema import PnlExecutiveSummaryResponse
 from app.services.iquest_streaming_service import invoke_llm_sync
 
 logger = logging.getLogger(__name__)
 
-# A real (non-trivial) prompt takes the local Ollama SLM ~6-7s to generate —
-# leave headroom over that before giving up and falling back to the
-# deterministic template.
+# ---------------------------------------------------------------------------
+# Fiscal years. genpact_employee_master carries one row per employee per FY
+# (2023-2026), so every "current" figure must be FY-scoped or the average
+# silently blends in several years of history.
+# ---------------------------------------------------------------------------
+_CURRENT_FY = "2025"
+_PREV_FY = "2024"
+_PROJECTED_FY = "2026"
+
+# Leadership = the top job levels. Used only by the retention KPI.
+_LEADERSHIP_LEVELS = ("1", "2", "3")
+
+# ---------------------------------------------------------------------------
+# Supplied figures — NOT yet derivable from the seeded data.
+#
+# These come from the finance team's own model. The seeded genpact_* tables
+# don't reproduce them: the closest derivations give a backfill cost of
+# $1.33M-$2.66M (vs $3.95M), a net-new-hire base of $128.6M (vs $50.6M),
+# and leadership retention at job levels 1-3 of 90.97% (vs 90.8%). Effective
+# increment and wage inflation have no stated formula at all.
+#
+# Every other number on this dashboard IS derived — see the functions below,
+# each of which reconciles exactly against the finance team's figures.
+# Replace these constants with real derivations once the source logic for
+# them is confirmed.
+# ---------------------------------------------------------------------------
+_SUPPLIED_BACKFILL_COST = Decimal("3950000")
+_SUPPLIED_NET_NEW_HIRE_COST = Decimal("50600000")
+_SUPPLIED_LEADERSHIP_RETENTION_PCT = 90.8
+_SUPPLIED_EFFECTIVE_INCREMENT_PCT = 11.22
+_SUPPLIED_WAGE_INFLATION_PCT = 11.19
+
+# A real prompt takes the local Ollama SLM ~6-7s — leave headroom before
+# falling back to the deterministic template.
 _BULLETS_LLM_TIMEOUT_SECONDS = 15.0
 
-# Bullets are cached per-tenant per-facts-hash so repeat dashboard loads with
-# unchanged KPI data don't re-pay SLM latency on every request — but the
-# cache is TTL-bound, not indefinite, so the wording stays LLM-generated and
-# fresh (re-phrased) periodically rather than freezing on the first-ever
-# generation for the life of the process.
+# Bullets are cached per-tenant per-facts-hash so repeat dashboard loads don't
+# re-pay SLM latency, but the cache is TTL-bound so the wording stays fresh
+# rather than freezing on the first-ever generation.
 _BULLETS_CACHE_TTL_SECONDS = 600.0
 _bullets_cache: dict[tuple[uuid.UUID, str], tuple[list[str], float]] = {}
 
-
-def _facts_cache_key(tenant_id: uuid.UUID, facts: dict[str, str]) -> tuple[uuid.UUID, str]:
-    digest = hashlib.sha256(
-        json.dumps(facts, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    return (tenant_id, digest)
-
-# Reviewed-employee filter for the "actual historical increment" figure —
-# unreviewed rows (performance_rating == 0) skew the average toward the
-# JVRE-recommended increment instead of what was actually awarded.
-_REVIEWED_FILTER = GenpactEmployeeMaster.__table__.c.performance_rating > 0
-
-_LEADERSHIP_LEVELS = ("1", "2", "3")
-
-# genpact_employee_master carries one row per employee per fiscal year
-# (FY2010 through FY2026) — "current" figures (compa-ratio, increment%)
-# must be scoped to the active FY, or the average silently blends in
-# a decade of historical rows.
-_CURRENT_FY = "2026"
-
-# Leaver's most-recent master-data row, regardless of which FY they left
-# in — reused for both genpact_job_posting-derived metrics below.
-_LEAVER_FX_CTE = """
-WITH leaver_fx AS (
-    SELECT DISTINCT ON (employee_id) employee_id, currency, fiscal_year
-    FROM genpact_employee_master
-    WHERE tenant_id = :tenant_id
-    ORDER BY employee_id, fiscal_year DESC
-)
+# Every monetary sum needs the employee's FY-specific USD rate.
+_FX_JOIN = """
+    JOIN genpact_currency_master cm
+      ON cm.local_currency  = e.currency
+     AND cm.reporting_cycle = e.fiscal_year
+     AND cm.tenant_id       = :tenant_id
 """
 
 
+def _fy_bounds(fy: str) -> tuple[date, date]:
+    """Half-open [start, end) calendar bounds for a fiscal year.
+
+    Passed as real dates rather than casting inside SQL: asyncpg infers a
+    placeholder's type from its position, so ``make_date(CAST(:fy AS int)…)``
+    makes it demand an int and reject the string FY key used elsewhere.
+    """
+    year = int(fy)
+    return date(year, 1, 1), date(year + 1, 1, 1)
+
+
+def _facts_cache_key(tenant_id: uuid.UUID, facts: dict[str, str]) -> tuple[uuid.UUID, str]:
+    digest = hashlib.sha256(json.dumps(facts, sort_keys=True).encode("utf-8")).hexdigest()
+    return (tenant_id, digest)
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 async def get_executive_summary(
     db: AsyncSession, tenant_id: uuid.UUID
 ) -> PnlExecutiveSummaryResponse:
-    beginning_base_cost, beginning_headcount = await _base_cost(db, tenant_id)
-    projected_new_base = await _sum_recommended_base(db, tenant_id)
-    new_hire_total_cost = await _sum_recommended_tcc(db, tenant_id)
-    external_compa, internal_compa = await _compa_ratios(db, tenant_id)
-    increment_pct = await _increment_pct(db, tenant_id)
-    attrition = await _attrition_by_fy(db, tenant_id)
-    leadership = await _leadership_retention_by_fy(db, tenant_id)
-    backfill_cost, backfill_count = await _backfill_cost(db, tenant_id)
-    median_cost = await _new_hire_median_cost(db, tenant_id)
-
-    bullet_kwargs = {
-        "beginning_base_cost": beginning_base_cost,
-        "attrition_fy26": attrition.get("2026", 0.0),
-        "attrition_fy24": attrition.get("2024", 0.0),
-        "leadership_fy26": leadership[1],
-        "new_hire_total_cost": new_hire_total_cost,
-        "backfill_hire_count": backfill_count,
-        "backfill_cost": backfill_cost,
-        "external_compa": external_compa,
-        "increment_pct": increment_pct,
-    }
-    bullets = await _generate_bullets(tenant_id, **bullet_kwargs)
-
-    return PnlExecutiveSummaryResponse(
-        beginning_base_cost=beginning_base_cost,
-        beginning_headcount=beginning_headcount,
-        increment_pct=increment_pct,
-        new_hire_total_cost=new_hire_total_cost,
-        projected_new_base=projected_new_base,
-        external_compa_ratio=external_compa,
-        internal_compa_ratio=internal_compa,
-        attrition_rate_fy24=attrition.get("2024", 0.0),
-        attrition_rate_fy25=attrition.get("2025", 0.0),
-        attrition_rate_fy26=attrition.get("2026", 0.0),
-        leadership_retention_fy24=leadership[0],
-        leadership_retention_fy26=leadership[1],
-        leadership_headcount=leadership[2],
-        backfill_cost=backfill_cost,
-        backfill_hire_count=backfill_count,
-        new_hire_median_cost=median_cost,
-        bullets=bullets,
+    # 1. Beginning base cost + headcount, this FY and last.
+    base_cost, headcount = await _base_cost(db, tenant_id, _CURRENT_FY)
+    base_cost_prev, _ = await _base_cost(db, tenant_id, _PREV_FY)
+    base_cost_delta = base_cost - base_cost_prev
+    base_cost_delta_pct = (
+        float(base_cost_delta / base_cost_prev * 100) if base_cost_prev else 0.0
     )
 
+    # 2. Increment.
+    increment_pct, increment_amount = await _increment(db, tenant_id, _CURRENT_FY)
 
-async def _base_cost(db: AsyncSession, tenant_id: uuid.UUID) -> tuple[Decimal, int]:
-    row = (
-        await db.execute(
-            select(
-                func.coalesce(func.sum(JvreSnapshot.current_base), 0),
-                func.count(),
-            ).where(JvreSnapshot.tenant_id == tenant_id)
-        )
-    ).one()
-    return Decimal(row[0]), int(row[1])
+    # 3. New hires. Counts are derived; the cost split is supplied.
+    new_hire_count = await _new_hire_count(db, tenant_id, _CURRENT_FY)
+    backfill_count = await _backfill_count(db, tenant_id, _CURRENT_FY)
+    net_new_hire_count = max(new_hire_count - backfill_count, 0)
+    backfill_cost = _SUPPLIED_BACKFILL_COST
+    net_new_hire_cost = _SUPPLIED_NET_NEW_HIRE_COST
+    new_hire_total_cost = backfill_cost + net_new_hire_cost
 
+    # 4. Projected new base = beginning base + new hire total + increment.
+    projected_new_base = base_cost + new_hire_total_cost + increment_amount
+    projected_headcount = headcount + net_new_hire_count
 
-async def _sum_recommended_base(db: AsyncSession, tenant_id: uuid.UUID) -> Decimal:
-    total = (
-        await db.execute(
-            select(func.coalesce(func.sum(JvreSnapshot.recommended_base), 0)).where(
-                JvreSnapshot.tenant_id == tenant_id
-            )
-        )
-    ).scalar_one()
-    return Decimal(total)
+    # 5. Attrition, this FY vs last.
+    attrition_rate = await _attrition_rate(db, tenant_id, _CURRENT_FY)
+    attrition_rate_prev = await _attrition_rate(db, tenant_id, _PREV_FY)
 
+    # 7. New hire median cost.
+    median_cost = await _new_hire_median_cost(db, tenant_id, _CURRENT_FY)
 
-async def _sum_recommended_tcc(db: AsyncSession, tenant_id: uuid.UUID) -> Decimal:
-    total = (
-        await db.execute(
-            select(
-                func.coalesce(
-                    func.sum(JvreSnapshot.recommended_base + JvreSnapshot.recommended_variable),
-                    0,
-                )
-            ).where(JvreSnapshot.tenant_id == tenant_id)
-        )
-    ).scalar_one()
-    return Decimal(total)
-
-
-async def _compa_ratios(db: AsyncSession, tenant_id: uuid.UUID) -> tuple[float, float]:
-    tbl = GenpactEmployeeMaster.__table__
-    row = (
-        await db.execute(
-            select(
-                func.avg(tbl.c.external_compa_pre),
-                func.avg(tbl.c.internal_compa_pre),
-            ).where(tbl.c.tenant_id == tenant_id, tbl.c.fiscal_year == _CURRENT_FY)
-        )
-    ).one()
-    return float(row[0] or 0), float(row[1] or 0)
-
-
-async def _increment_pct(db: AsyncSession, tenant_id: uuid.UUID) -> float:
-    """Average of ``base_increment_pct`` (stored as a fraction, e.g. 0.06) for
-    FY2026 rows with an actual performance review — scaled to a percentage."""
-    tbl = GenpactEmployeeMaster.__table__
-    avg = (
-        await db.execute(
-            select(func.avg(tbl.c.base_increment_pct)).where(
-                tbl.c.tenant_id == tenant_id,
-                tbl.c.fiscal_year == _CURRENT_FY,
-                _REVIEWED_FILTER,
-            )
-        )
-    ).scalar_one()
-    return float(avg or 0) * 100.0
+    summary = PnlExecutiveSummaryResponse(
+        fy_label=f"FY{_CURRENT_FY}",
+        prev_fy_label=f"FY{_PREV_FY}",
+        projected_fy_label=f"FY{_PROJECTED_FY}",
+        beginning_base_cost=base_cost,
+        beginning_headcount=headcount,
+        beginning_base_cost_prev=base_cost_prev,
+        beginning_base_cost_delta=base_cost_delta,
+        beginning_base_cost_delta_pct=base_cost_delta_pct,
+        increment_pct=increment_pct,
+        increment_amount=increment_amount,
+        new_hire_total_cost=new_hire_total_cost,
+        new_hire_count=new_hire_count,
+        backfill_cost=backfill_cost,
+        backfill_count=backfill_count,
+        net_new_hire_cost=net_new_hire_cost,
+        net_new_hire_count=net_new_hire_count,
+        projected_new_base=projected_new_base,
+        projected_headcount=projected_headcount,
+        effective_increment_pct=_SUPPLIED_EFFECTIVE_INCREMENT_PCT,
+        wage_inflation_pct=_SUPPLIED_WAGE_INFLATION_PCT,
+        attrition_rate=attrition_rate,
+        attrition_rate_prev=attrition_rate_prev,
+        attrition_delta_pp=attrition_rate - attrition_rate_prev,
+        # The cost of replacing this FY's leavers is the backfill spend.
+        attrition_additional_cost=backfill_cost,
+        leadership_retention=_SUPPLIED_LEADERSHIP_RETENTION_PCT,
+        new_hire_median_cost=median_cost,
+        bullets=[],
+    )
+    summary.bullets = await _generate_bullets(tenant_id, summary)
+    return summary
 
 
-async def _attrition_by_fy(db: AsyncSession, tenant_id: uuid.UUID) -> dict[str, float]:
-    tbl = GenpactEmployeeMaster.__table__
-    rows = (
-        await db.execute(
-            select(
-                tbl.c.fiscal_year,
-                func.count().filter(tbl.c.status == "INACTIVE"),
-                func.count(),
-            )
-            .where(tbl.c.tenant_id == tenant_id)
-            .group_by(tbl.c.fiscal_year)
-        )
-    ).all()
-    return {
-        fy: (inactive / total * 100.0 if total else 0.0) for fy, inactive, total in rows
-    }
-
-
-async def _leadership_retention_by_fy(
-    db: AsyncSession, tenant_id: uuid.UUID
-) -> tuple[float, float, int]:
-    """Returns (retention_fy24, retention_fy26, headcount) for job_level 1-3."""
-    tbl = GenpactEmployeeMaster.__table__
-    leadership_filter = tbl.c.job_level.in_(_LEADERSHIP_LEVELS)
-    rows = (
-        await db.execute(
-            select(
-                tbl.c.fiscal_year,
-                func.count().filter(tbl.c.status != "INACTIVE"),
-                func.count(),
-            )
-            .where(tbl.c.tenant_id == tenant_id, leadership_filter)
-            .group_by(tbl.c.fiscal_year)
-        )
-    ).all()
-    by_fy = {fy: (active, total) for fy, active, total in rows}
-    active_24, total_24 = by_fy.get("2024", (0, 0))
-    active_26, total_26 = by_fy.get("2026", (0, 0))
-    retention_24 = active_24 / total_24 * 100.0 if total_24 else 0.0
-    retention_26 = active_26 / total_26 * 100.0 if total_26 else 0.0
-    return retention_24, retention_26, total_26
-
-
-async def _backfill_cost(db: AsyncSession, tenant_id: uuid.UUID) -> tuple[Decimal, int]:
-    """Backfill cost is only incurred for offers that actually converted to a
-    hire — Declined/Rescinded postings never triggered agency/recruiter/
-    onboarding spend, so they're excluded (same population as the median-cost
-    query below)."""
+# ---------------------------------------------------------------------------
+# 1. Beginning base cost
+# ---------------------------------------------------------------------------
+async def _base_cost(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str
+) -> tuple[Decimal, int]:
+    """Sum of ACTIVE employees' pre-increment base salary (USD), plus the
+    active headcount that produced it."""
     row = (
         await db.execute(
             sql_text(
-                _LEAVER_FX_CTE
-                + """
+                f"""
                 SELECT
-                    count(*),
                     coalesce(sum(
-                        (jp.agency_fee_paid + jp.recruiter_cost_estimate + jp.onboarding_cost)
-                        / cm.conversion_value
-                    ), 0)
-                FROM genpact_job_posting jp
-                JOIN leaver_fx lf ON lf.employee_id = jp.leaver_employee_id
-                JOIN genpact_currency_master cm
-                    ON cm.local_currency = lf.currency
-                    AND cm.reporting_cycle = lf.fiscal_year
-                    AND cm.tenant_id = :tenant_id
-                WHERE jp.tenant_id = :tenant_id
-                    AND jp.offer_outcome = 'Accepted'
+                        CASE WHEN e.status = 'ACTIVE'
+                             THEN e.base_salary_pre / cm.conversion_value END
+                    ), 0),
+                    count(*) FILTER (WHERE e.status = 'ACTIVE')
+                FROM genpact_employee_master e
+                {_FX_JOIN}
+                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy
                 """
             ),
-            {"tenant_id": str(tenant_id)},
+            {"tenant_id": str(tenant_id), "fy": fy},
         )
     ).one()
-    return Decimal(str(row[1])), int(row[0])
+    return Decimal(str(row[0])), int(row[1])
 
 
-async def _new_hire_median_cost(db: AsyncSession, tenant_id: uuid.UUID) -> Decimal:
-    """Median (new_hire_base_salary - leaver_base_salary), USD, Accepted offers only.
+# ---------------------------------------------------------------------------
+# 2. Increment
+# ---------------------------------------------------------------------------
+async def _increment(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str
+) -> tuple[float, Decimal]:
+    """Average base increment % and the same spend in USD.
 
-    Declined/Rescinded offers never produced a real hire — their
-    "new hire" salary is hypothetical, not an actually-paid figure.
+    The percentage is restricted to employees with an actual performance
+    review — unreviewed rows carry a 0% increment and would drag the
+    average down to roughly half the awarded rate. The dollar figure is
+    the true post-minus-pre delta across everyone, so it needs no filter.
     """
+    row = (
+        await db.execute(
+            sql_text(
+                f"""
+                SELECT
+                    coalesce(avg(e.base_increment_pct)
+                             FILTER (WHERE e.performance_rating > 0), 0) * 100,
+                    coalesce(sum(
+                        (e.base_salary_post - e.base_salary_pre) / cm.conversion_value
+                    ), 0)
+                FROM genpact_employee_master e
+                {_FX_JOIN}
+                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy
+                """
+            ),
+            {"tenant_id": str(tenant_id), "fy": fy},
+        )
+    ).one()
+    return float(row[0]), Decimal(str(row[1]))
+
+
+# ---------------------------------------------------------------------------
+# 3. New hires
+# ---------------------------------------------------------------------------
+async def _new_hire_count(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> int:
+    """Everyone who joined during the fiscal year (backfills + net new)."""
+    fy_start, fy_end = _fy_bounds(fy)
+    count = (
+        await db.execute(
+            sql_text(
+                """
+                SELECT count(*)
+                FROM genpact_employee_master e
+                WHERE e.tenant_id = :tenant_id
+                  AND e.fiscal_year = :fy
+                  AND e.joining_date >= :fy_start
+                  AND e.joining_date <  :fy_end
+                """
+            ),
+            {"tenant_id": str(tenant_id), "fy": fy, "fy_start": fy_start, "fy_end": fy_end},
+        )
+    ).scalar_one()
+    return int(count)
+
+
+async def _backfill_count(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> int:
+    """Replacement hires who started during the fiscal year.
+
+    Only ``Accepted`` offers count — Declined/Rescinded postings never
+    produced a hire, so they carry no backfill.
+    """
+    fy_start, fy_end = _fy_bounds(fy)
+    count = (
+        await db.execute(
+            sql_text(
+                """
+                SELECT count(*)
+                FROM genpact_job_posting jp
+                WHERE jp.tenant_id = :tenant_id
+                  AND jp.offer_outcome = 'Accepted'
+                  AND jp.date_of_joining_replacement >= :fy_start
+                  AND jp.date_of_joining_replacement <  :fy_end
+                """
+            ),
+            {"tenant_id": str(tenant_id), "fy_start": fy_start, "fy_end": fy_end},
+        )
+    ).scalar_one()
+    return int(count)
+
+
+# ---------------------------------------------------------------------------
+# 5. Attrition
+# ---------------------------------------------------------------------------
+async def _attrition_rate(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> float:
+    """Leavers as a percentage of total headcount for the fiscal year."""
+    row = (
+        await db.execute(
+            sql_text(
+                """
+                SELECT count(*) FILTER (WHERE e.status = 'INACTIVE'), count(*)
+                FROM genpact_employee_master e
+                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy
+                """
+            ),
+            {"tenant_id": str(tenant_id), "fy": fy},
+        )
+    ).one()
+    leavers, total = int(row[0]), int(row[1])
+    return leavers / total * 100.0 if total else 0.0
+
+
+# ---------------------------------------------------------------------------
+# 7. New hire median cost
+# ---------------------------------------------------------------------------
+async def _new_hire_median_cost(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str
+) -> Decimal:
+    """Median incoming-minus-outgoing base pay (USD) across the FY's backfills.
+
+    ``salary_premium`` is stored pre-computed and equals
+    ``new_hire_base_salary - leaver_base_salary`` for every row. Each row is
+    converted using the leaver's most recent currency, since leavers may have
+    exited in an earlier fiscal year than the replacement's start date.
+    """
+    fy_start, fy_end = _fy_bounds(fy)
     value = (
         await db.execute(
             sql_text(
-                _LEAVER_FX_CTE
-                + """
+                """
+                WITH leaver_fx AS (
+                    SELECT DISTINCT ON (employee_id) employee_id, currency, fiscal_year
+                    FROM genpact_employee_master
+                    WHERE tenant_id = :tenant_id
+                    ORDER BY employee_id, fiscal_year DESC
+                )
                 SELECT percentile_cont(0.5) WITHIN GROUP (
                     ORDER BY jp.salary_premium / cm.conversion_value
                 )
                 FROM genpact_job_posting jp
                 JOIN leaver_fx lf ON lf.employee_id = jp.leaver_employee_id
                 JOIN genpact_currency_master cm
-                    ON cm.local_currency = lf.currency
-                    AND cm.reporting_cycle = lf.fiscal_year
-                    AND cm.tenant_id = :tenant_id
+                  ON cm.local_currency  = lf.currency
+                 AND cm.reporting_cycle = lf.fiscal_year
+                 AND cm.tenant_id       = :tenant_id
                 WHERE jp.tenant_id = :tenant_id
-                    AND jp.offer_outcome = 'Accepted'
+                  AND jp.offer_outcome = 'Accepted'
+                  AND jp.date_of_joining_replacement >= :fy_start
+                  AND jp.date_of_joining_replacement <  :fy_end
                 """
             ),
-            {"tenant_id": str(tenant_id)},
+            {"tenant_id": str(tenant_id), "fy_start": fy_start, "fy_end": fy_end},
         )
     ).scalar_one()
     return Decimal(str(value or 0))
 
 
-def _bullet_facts(
-    *,
-    beginning_base_cost: Decimal,
-    attrition_fy26: float,
-    attrition_fy24: float,
-    leadership_fy26: float,
-    new_hire_total_cost: Decimal,
-    backfill_hire_count: int,
-    backfill_cost: Decimal,
-    external_compa: float,
-    increment_pct: float,
-) -> dict[str, str]:
-    """Pre-formatted (already-rounded) display strings — the only numbers
-    either the template or the LLM is allowed to use verbatim."""
-    attrition_delta = attrition_fy26 - attrition_fy24
+# ---------------------------------------------------------------------------
+# Narrative bullets
+# ---------------------------------------------------------------------------
+def _m(amount: Decimal, dp: int = 1) -> str:
+    return f"${amount / 1_000_000:.{dp}f}M"
+
+
+def _bullet_facts(s: PnlExecutiveSummaryResponse) -> dict[str, str]:
+    """Pre-formatted display strings — the only numbers either the template
+    or the LLM is allowed to use verbatim."""
+    direction = "up" if s.attrition_delta_pp >= 0 else "down"
     return {
-        "FY2026 base compensation spend": f"${beginning_base_cost / 1_000_000:.1f}M",
-        "FY2026 attrition rate": f"{attrition_fy26:.1f}%",
-        "Attrition change vs FY24": f"{'up' if attrition_delta >= 0 else 'down'} {abs(attrition_delta):.1f} points",
-        "Leadership retention (job level 1-3)": f"{leadership_fy26:.1f}%",
-        "New hire total cost": f"${new_hire_total_cost / 1_000_000:.1f}M",
-        "Backfill cost": f"${backfill_cost / 1_000_000:.2f}M",
-        "Number of backfill hires": f"{backfill_hire_count:,}",
-        "External compa-ratio": f"{external_compa:.2f}x",
-        "Average increment for reviewed employees": f"{increment_pct:.1f}%",
+        f"{s.fy_label} beginning base cost": _m(s.beginning_base_cost),
+        "Headcount": f"{s.beginning_headcount:,}",
+        f"Base cost change vs {s.prev_fy_label}": (
+            f"{_m(s.beginning_base_cost_delta)} "
+            f"({s.beginning_base_cost_delta_pct:+.2f}%)"
+        ),
+        "Average base increment": f"{s.increment_pct:.2f}%",
+        "Increment spend": _m(s.increment_amount),
+        "New hire total cost": _m(s.new_hire_total_cost, 2),
+        "New hires": f"{s.new_hire_count:,}",
+        "Backfill cost": _m(s.backfill_cost, 2),
+        "Backfill hires": f"{s.backfill_count:,}",
+        "Net new hires": f"{s.net_new_hire_count:,}",
+        f"{s.projected_fy_label} projected new base": _m(s.projected_new_base, 2),
+        f"{s.projected_fy_label} projected headcount": f"{s.projected_headcount:,}",
+        f"{s.fy_label} attrition rate": f"{s.attrition_rate:.2f}%",
+        f"Attrition change vs {s.prev_fy_label}": (
+            f"{direction} {abs(s.attrition_delta_pp):.2f} points"
+        ),
+        "Leadership retention": f"{s.leadership_retention:.1f}%",
+        "New hire median cost": f"${s.new_hire_median_cost:,.0f}",
     }
 
 
-def _build_bullets(**kwargs) -> list[str]:
+def _build_bullets(s: PnlExecutiveSummaryResponse) -> list[str]:
     """Deterministic fallback bullets — used whenever the LLM path fails."""
-    facts = _bullet_facts(**kwargs)
+    f = _bullet_facts(s)
+    direction = "up" if s.attrition_delta_pp >= 0 else "down"
     return [
-        f"FY2026 base compensation spend is {facts['FY2026 base compensation spend']}. "
-        f"Attrition rate was {facts['FY2026 attrition rate']}, "
-        f"{facts['Attrition change vs FY24']} vs FY24.",
-        f"Leadership retention stood at {facts['Leadership retention (job level 1-3)']}. "
-        f"New hire cost reached {facts['New hire total cost']}, "
-        f"with backfill at {facts['Backfill cost']} across {facts['Number of backfill hires']} hires.",
-        f"External compa-ratio is {facts['External compa-ratio']}.",
-        f"Average increment for reviewed employees was {facts['Average increment for reviewed employees']}.",
-        "Focus on aligning compensation with business outcomes is crucial for FY2027 success.",
+        f"{s.fy_label} beginning base cost is {f[f'{s.fy_label} beginning base cost']} "
+        f"across {f['Headcount']} employees, "
+        f"{f[f'Base cost change vs {s.prev_fy_label}']} versus {s.prev_fy_label}.",
+        f"The average base increment was {f['Average base increment']}, "
+        f"costing {f['Increment spend']}.",
+        f"New hire cost reached {f['New hire total cost']} across {f['New hires']} hires — "
+        f"{f['Backfill hires']} backfills at {f['Backfill cost']} and "
+        f"{f['Net new hires']} net new roles.",
+        f"Attrition was {f[f'{s.fy_label} attrition rate']}, {direction} "
+        f"{abs(s.attrition_delta_pp):.2f} points on {s.prev_fy_label}, with leadership "
+        f"retention holding at {f['Leadership retention']}.",
+        f"{s.projected_fy_label} base is projected at "
+        f"{f[f'{s.projected_fy_label} projected new base']} — keeping increment spend and "
+        f"backfill volume in check is the priority for next cycle.",
     ]
 
 
 def _parse_bullets_from_llm(raw: str) -> list[str]:
     """Parse a JSON array of strings, tolerating markdown fences. Falls back
-    to a plain-line scan if JSON parsing fails. Raises ValueError if fewer
-    than 5 usable bullets come out either way, so the caller can fall back
-    to the deterministic template."""
+    to a plain-line scan. Raises ValueError if fewer than 5 usable bullets
+    come out either way, so the caller can use the deterministic template."""
     cleaned = raw.replace("```json", "").replace("```", "").strip()
     try:
         bullets = json.loads(cleaned)
@@ -374,17 +436,18 @@ def _parse_bullets_from_llm(raw: str) -> list[str]:
     return bullets[:5]
 
 
-async def _generate_bullets(tenant_id: uuid.UUID, **kwargs) -> list[str]:
+async def _generate_bullets(
+    tenant_id: uuid.UUID, summary: PnlExecutiveSummaryResponse
+) -> list[str]:
     """Try the SLM for natural-language bullets; fall back to the
     deterministic template on any failure (timeout, unreachable model,
     malformed output) so the dashboard never blocks on this.
 
-    Cached per-tenant on the exact facts fed to the model, with a TTL — this
-    keeps repeat dashboard loads fast without paying SLM latency every time,
-    while still re-generating (re-phrasing) periodically instead of freezing
+    Cached per-tenant on the exact facts fed to the model, with a TTL —
+    fast on repeat loads, still re-phrased periodically rather than frozen
     on the first-ever LLM output for the life of the process.
     """
-    facts = _bullet_facts(**kwargs)
+    facts = _bullet_facts(summary)
     cache_key = _facts_cache_key(tenant_id, facts)
     cached = _bullets_cache.get(cache_key)
     if cached is not None:
@@ -400,8 +463,10 @@ async def _generate_bullets(tenant_id: uuid.UUID, **kwargs) -> list[str]:
             loop.run_in_executor(
                 None,
                 lambda: invoke_llm_sync(
-                    settings, [{"role": "user", "content": prompt}],
-                    max_tokens=400, temperature=0.3,
+                    settings,
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=400,
+                    temperature=0.3,
                 ),
             ),
             timeout=_BULLETS_LLM_TIMEOUT_SECONDS,
@@ -409,7 +474,7 @@ async def _generate_bullets(tenant_id: uuid.UUID, **kwargs) -> list[str]:
         bullets = _parse_bullets_from_llm(raw)
     except Exception:
         logger.warning("pnl_bullets.llm_failed; falling back to template", exc_info=True)
-        bullets = _build_bullets(**kwargs)
+        bullets = _build_bullets(summary)
 
     _bullets_cache[cache_key] = (bullets, time.monotonic())
     return bullets

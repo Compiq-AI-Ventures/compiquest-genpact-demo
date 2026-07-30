@@ -70,6 +70,10 @@ async def stream_generate(
         "model": model,
         "prompt": prompt,
         "stream": True,
+        # Thinking models (e.g. qwen3.5) otherwise burn num_predict on hidden
+        # reasoning and never emit a "response" token. Ignored by models that
+        # don't support it.
+        "think": False,
         "options": {"temperature": temperature, "num_predict": max_tokens},
     }
     async with (

@@ -109,6 +109,10 @@ def _run_ollama_stream(
         "model": model,
         "prompt": prompt,
         "stream": True,
+        # Thinking models (e.g. qwen3.5) otherwise burn num_predict on hidden
+        # reasoning and never emit a "response" token. Ignored by models that
+        # don't support it.
+        "think": False,
         "options": {"temperature": temperature, "num_predict": max_tokens},
     }
     if system:
@@ -216,6 +220,9 @@ def invoke_llm_sync(
             "model": settings.ollama_model,
             "prompt": prompt,
             "stream": False,
+            # Thinking models (e.g. qwen3.5) otherwise burn num_predict on
+            # hidden reasoning and never emit a "response" token.
+            "think": False,
             "options": {"temperature": temperature, "num_predict": max_tokens},
         })
         return resp.json().get("response", "")
@@ -317,7 +324,7 @@ Active Signals: Promotion in scope={_fmt(eng.promotion_flag)} | No increase in m
 - Use the "Market position" line above for direction: if it says ABOVE market, justify a modest, performance-led increase; if BELOW market, justify a market correction; if in line, frame it as maintaining alignment. Do not state this backwards.
 - ONLY describe this as a promotion or level change if "Promotion in scope" is True. If it is False, treat it as a within-band adjustment and never claim the employee is being promoted.
 - Do not cite equity, vesting, or replacement-cost figures that are shown as N/A — omit them instead of inventing values.
-- 2-3 short paragraphs, 90-150 words total. Bold only 1-3 key items. State currency amounts with correct thousands-comma grouping. End with a complete, forward-looking sentence.
+- 2-3 short paragraphs, 90-150 words total. Bold only 1-3 key items, using markdown **double-asterisks** around each bolded item. State currency amounts with correct thousands-comma grouping. End with a complete, forward-looking sentence.
 
 === RATIONALE ==="""
     )

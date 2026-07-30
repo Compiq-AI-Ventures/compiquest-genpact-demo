@@ -116,7 +116,7 @@ OUTPUT FORMAT — follow every rule exactly:
 - Use 2-3 short paragraphs separated by a single blank line.
 - Each paragraph: 2-3 sentences.
 - Total length: 90-150 words maximum.
-- Bold only 1-3 items total (salary increase %, new base salary, or strongest business justification).
+- Bold only 1-3 items total (salary increase %, new base salary, or strongest business justification), using markdown **double-asterisks** around each bolded item.
 - Use exact ₹ values only when they add clarity.
 - Do not show calculations, formulas, or compensation mechanics.
 - Never mention: compa-ratio, P25/P50/P75, percentile, JVRE score, retention risk score, exit risk, F1/F2/F3/F4, signal scores, band ceiling, funding gap, multi-cycle, or any internal scoring or optimization method.
@@ -134,7 +134,7 @@ OUTPUT FORMAT — follow every rule exactly:
 - Use 2-3 short paragraphs separated by a single blank line.
 - Each paragraph: 2-3 sentences.
 - Total length: 90-150 words maximum.
-- Bold only 1-3 key figures (remaining headroom, pool utilisation, or most urgent team item).
+- Bold only 1-3 key figures (remaining headroom, pool utilisation, or most urgent team item), using markdown **double-asterisks** around each bolded figure.
 - Use exact currency values only when they add clarity.
 - Do not show calculations or formulas.
 - Never mention: compa-ratio, P25/P50/P75, percentile, JVRE score, or internal scoring methods by name.
@@ -154,7 +154,7 @@ OUTPUT FORMAT — follow every rule exactly:
 - Each paragraph: 2-3 sentences.
 - Total length: 90-150 words maximum.
 - Bold only 1-3 key figures (submission progress, budget utilisation, or the most
-  urgent cycle-wide item).
+  urgent cycle-wide item), using markdown **double-asterisks** around each bolded figure.
 - Use exact currency values and counts only when they add clarity.
 - Do not show calculations or formulas.
 - Never disclose individual employee compensation details — this is aggregate-only.

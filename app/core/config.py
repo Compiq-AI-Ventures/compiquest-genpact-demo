@@ -109,6 +109,21 @@ class Settings(BaseSettings):
     # implies one. Tessot master data is anchored to FY2026.
     compchat_default_fiscal_year: int = 2026
 
+    # --- CD&A report generator (Compensation Discussion & Analysis) -----
+    # Local model used to narrate the CD&A report's data-driven sections.
+    # Runs through the same Ollama endpoint (``ollama_base_url``). Numbers
+    # are always deterministic (parsed from the uploaded workbook); the
+    # model only writes connective prose grounded in those numbers plus the
+    # bundled domain knowledge base — it never authors a figure. Defaults to
+    # ``qwen3.5:9b`` (the tag pulled locally). Override with ``CDA_MODEL`` if
+    # you pull a different tag. If the model is unreachable the generator
+    # falls back to a deterministic narrative, so a running Ollama is
+    # optional for the endpoint to succeed.
+    cda_model: str = "qwen3.5:9b"
+    # Ceiling on narration length per section (num_predict).
+    cda_max_tokens: int = 500
+    cda_temperature: float = 0.2
+
     # --- Logging ---------------------------------------------------------
     # Root log level. Accepts standard Python logging names.
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

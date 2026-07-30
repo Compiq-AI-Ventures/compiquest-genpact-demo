@@ -75,6 +75,9 @@ docs/
 !docs/specs/
 !docs/specs/**
 
+# Markdown scratch/notes files. Already-tracked docs (README.md, CLAUDE.md,
+# API_DOCUMENTATION.md, docs/specs/**) are unaffected — gitignore never
+# untracks files git already tracks.
 *.md
 *.xlsx
 

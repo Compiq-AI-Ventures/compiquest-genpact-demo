@@ -36,6 +36,9 @@ dependencies = [
     "boto3>=1.43.26",
     "fpdf2>=2.8.7",
     "openpyxl>=3.1.5",
+    "python-multipart>=0.0.9",
+    "pypdf>=4.0.0",
+    "python-docx>=1.2.0",
 ]
 
 [dependency-groups]
@@ -86,6 +89,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/**/*.py" = ["S101"]
+# The CD&A report faithfully transcribes proxy-statement prose (curly quotes,
+# em/en dashes) and maps those exact glyphs to Latin-1 — the "ambiguous
+# unicode" characters are intentional there.
+"app/services/cda/template.py" = ["RUF001", "RUF002", "RUF003"]
+"app/services/cda/pdf_builder.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.format]
 quote-style = "double"

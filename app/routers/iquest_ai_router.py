@@ -19,7 +19,7 @@ import json
 import uuid
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -547,5 +547,83 @@ async def download_compensation_report(
             "X-Report-Trace-Id": str(run_id),
             "X-Report-Status": "COMPLETED",
             "X-Report-Narrative-Status": narrative_status,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Endpoint 4: CD&A (Compensation Discussion & Analysis) report from upload
+# ---------------------------------------------------------------------------
+
+# 10 MB ceiling — a compensation-table file is a few KB; anything larger is
+# almost certainly not the expected input.
+_CDA_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+_CDA_ACCEPTED_EXTS = (".xlsx", ".xlsm", ".docx", ".pdf")
+# The report is delivered as a Word document (.docx).
+_CDA_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+
+
+@router.post(
+    "/reports/cda",
+    summary="Generate a Compensation Discussion & Analysis (CD&A) Word document from an uploaded file",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {_CDA_MEDIA_TYPE: {}},
+            "description": "The generated CD&A report (.docx), laid out per the Genpact template",
+        },
+        401: {"description": "Missing or invalid Bearer token"},
+        413: {"description": "Uploaded file exceeds the size limit"},
+        422: {"description": "The uploaded file could not be parsed into report data"},
+    },
+)
+async def generate_cda_report(
+    file: UploadFile = File(..., description="Executive compensation table (.xlsx, .docx, or .pdf)"),
+    ctx: TenantContext = Depends(get_tenant_context),
+) -> Response:
+    """Generate a CD&A report (.docx) from an uploaded compensation file.
+
+    Accepts an **.xlsx/.xlsm workbook, a .docx document, or a .pdf** carrying a
+    per-executive compensation table (Executive, Base Salary, Annual Bonus,
+    PSU, RSU). The parser detects the format by magic bytes and extracts every
+    figure deterministically from ``file``; the report's wording is the fixed
+    Genpact CD&A template and only the numbers in the compensation tables
+    change per upload. No language model is involved.
+
+    Auth-gated (any authenticated tenant user). No database access and no
+    persisted state — the Word document is generated and streamed straight back.
+    """
+    from app.services import cda
+
+    filename = file.filename or ""
+    if not filename.lower().endswith(_CDA_ACCEPTED_EXTS):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Please upload an .xlsx, .docx, or .pdf file.",
+        )
+
+    content = await file.read()
+    if len(content) > _CDA_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Uploaded file is too large (limit 10 MB).",
+        )
+
+    try:
+        docx_bytes = await cda.build_cda_report(content, filename=filename)
+    except cda.CDAParseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    return Response(
+        content=docx_bytes,
+        media_type=_CDA_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": 'attachment; filename="genpact_cda_report.docx"',
+            "X-Report-Status": "COMPLETED",
         },
     )

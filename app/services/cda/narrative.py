@@ -1,4 +1,4 @@
-"""Grounded narration for the CD&A executive summary (local model, optional).
+"""Grounded narration for the CD&A executive summary (AWS Bedrock, optional).
 
 The only place a language model touches the report. Its job is narrow: write
 one short synthesis paragraph for the executive summary, reasoning over the
@@ -7,7 +7,7 @@ base. It is forbidden from introducing any number that is not in the supplied
 facts — every figure in the report proper is rendered deterministically
 elsewhere.
 
-Runs against the local Ollama endpoint using ``settings.cda_model``. If the
+Runs against AWS Bedrock using ``settings.bedrock_model_id``. If the
 model is unreachable, slow, or returns nothing, the caller falls back to a
 deterministic paragraph built from the parsed bullets, so report generation
 never depends on the model being up.
@@ -15,20 +15,22 @@ never depends on the model being up.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Any
 
-import httpx
+from app.services.bedrock_client import get_bedrock_client
 
 from .knowledge_base import knowledge_block
 from .schema import ExecSummary
 
 logger = logging.getLogger(__name__)
 
-# Generous enough to cover a cold model load into memory on the first
-# request (~2 min for a 9B). Ollama keeps the model resident afterwards, so
-# subsequent requests return in seconds.
-_TIMEOUT = 240.0
+_APP_JSON = "application/json"
+
+# Bedrock has no cold-start model load, so a short timeout is enough.
+_TIMEOUT = 15.0
 
 _SYSTEM = (
     "You are a compensation-committee analyst drafting the opening paragraph of "
@@ -91,35 +93,46 @@ def _deterministic_fallback(es: ExecSummary) -> str:
     return ""
 
 
+def _invoke_bedrock(settings: Any, prompt: str, max_tokens: int, temperature: float) -> str:
+    client = get_bedrock_client(settings)
+    body = json.dumps({
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    })
+    resp = client.invoke_model(
+        modelId=settings.bedrock_model_id,
+        body=body,
+        contentType=_APP_JSON,
+        accept=_APP_JSON,
+    )
+    result = json.loads(resp["body"].read())
+    return (result.get("choices") or [{}])[0].get("message", {}).get("content", "")
+
+
 async def generate_exec_summary_narrative(settings: Any, es: ExecSummary) -> str:
     """Return a grounded synthesis paragraph, or a deterministic fallback.
 
     Never raises — any transport/parse failure degrades to the fallback.
     """
-    model = getattr(settings, "cda_model", None) or getattr(settings, "ollama_model", "")
-    base_url = getattr(settings, "ollama_base_url", "http://localhost:11434")
+    model = getattr(settings, "bedrock_model_id", "")
     if not model:
         return _deterministic_fallback(es)
 
-    payload = {
-        "model": model,
-        "prompt": _build_prompt(es),
-        "stream": False,
-        # qwen3.5 is a "thinking" model: left on, its reasoning consumes the
-        # token budget and the ``response`` field comes back empty. We want a
-        # direct answer, so thinking is disabled. Harmless for non-thinking
-        # models (Ollama ignores it).
-        "think": False,
-        "options": {
-            "temperature": getattr(settings, "cda_temperature", 0.2),
-            "num_predict": getattr(settings, "cda_max_tokens", 500),
-        },
-    }
     try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=_TIMEOUT) as client:
-            resp = await client.post("/api/generate", json=payload)
-            resp.raise_for_status()
-            text = (resp.json().get("response") or "").strip()
+        text = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _invoke_bedrock(
+                    settings,
+                    _build_prompt(es),
+                    max_tokens=getattr(settings, "cda_max_tokens", 500),
+                    temperature=getattr(settings, "cda_temperature", 0.2),
+                ),
+            ),
+            timeout=_TIMEOUT,
+        )
+        text = text.strip()
     except Exception as exc:
         logger.warning("CD&A narration unavailable (model=%s): %s — using fallback", model, exc)
         return _deterministic_fallback(es)

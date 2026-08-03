@@ -1010,13 +1010,15 @@ async def _seed_budget(
                 if child["employee_id"] not in subtree_tcc:
                     stack.append((child["employee_id"], False))
 
-    def pool_for(mgr_eid: str) -> Decimal:
+    def budget_for_allocation_for(mgr_eid: str) -> Decimal:
         tot = sum(
             (subtree_tcc.get(r["employee_id"], Decimal("0")) for r in directs_of.get(mgr_eid, [])),
             Decimal("0"),
         )
-        # Minimum floor is $1,000 USD (a real cap — a $0 pool is a nonsense state).
-        return max((tot * Decimal("1.10")).quantize(Decimal("1")), Decimal("1000"))
+        # 5% headroom above the direct reports' own (recommended-pay-based)
+        # subtree totals, so a manager can always fund every report's full
+        # JVRE recommendation without cutting anyone below it.
+        return max((tot * Decimal("1.05")).quantize(Decimal("1")), Decimal("1000"))
 
     alloc_id_of = {mgr: uuid.uuid4() for mgr in directs_of}
     mgr_of = {r["employee_id"]: r["manager_employee_id"] for r in fy2026}
@@ -1036,9 +1038,12 @@ async def _seed_budget(
     alloc_rows, line_rows = [], []
     for mgr_eid in ordered_mgrs:
         directs = directs_of[mgr_eid]
-        pool = pool_for(mgr_eid)
+        budget_for_allocation = budget_for_allocation_for(mgr_eid)
         reserve_pct = Decimal("0.05") if mgr_eid == cfo_eid else Decimal("0.115")
-        reserve = (pool * reserve_pct).quantize(Decimal("1"))
+        # Reserve is additional headroom on top of budget_for_allocation, not
+        # carved out of it — so it never eats into what reports are funded.
+        reserve = (budget_for_allocation * reserve_pct).quantize(Decimal("1"))
+        pool = budget_for_allocation + reserve
         aid = alloc_id_of[mgr_eid]
         parent_mgr = mgr_of.get(mgr_eid)
         alloc_rows.append(
@@ -1050,7 +1055,7 @@ async def _seed_budget(
                 "parent_allocation_id": alloc_id_of.get(parent_mgr),
                 "total_pool": pool,
                 "strategic_reserve": reserve,
-                "budget_for_allocation": pool - reserve,
+                "budget_for_allocation": budget_for_allocation,
                 "currency_code": DEFAULT_CURRENCY,
                 "status": (
                     BudgetAllocationStatus.SUBMITTED.value
@@ -1063,11 +1068,14 @@ async def _seed_budget(
         # Line-level split: each direct report gets share proportional to
         # the size of THEIR OWN subtree (fair pro-rata cascade), and
         # ``jvre_rec_amount`` = the report's subtree TCC (INR) — the same
-        # figure the runtime sums via _compute_jvre_pool_for.
+        # figure the runtime sums via _compute_jvre_pool_for. Since
+        # budget_for_allocation = 1.05 * sum(subtree_totals), each line's
+        # share works out to 1.05 * that report's own subtree total —
+        # 5% above their JVRE recommendation, never below it.
         subtree_totals = [subtree_tcc.get(r["employee_id"], Decimal("0")) for r in directs]
         total_subtree = sum(subtree_totals, Decimal("0")) or Decimal("1")
         for r, sub in zip(directs, subtree_totals):
-            share = (pool * (sub / total_subtree)).quantize(Decimal("1"))
+            share = (budget_for_allocation * (sub / total_subtree)).quantize(Decimal("1"))
             base = (share * Decimal("0.65")).quantize(Decimal("1"))
             var = (share * Decimal("0.20")).quantize(Decimal("1"))
             lti = (share * Decimal("0.10")).quantize(Decimal("1"))

@@ -21,6 +21,12 @@ class PnlExecutiveSummaryResponse(BaseModel):
     prev_fy_label: str
     projected_fy_label: str
 
+    # Human-readable name for the population the KPIs are measured on: the
+    # BU name for a PNL_HEAD (their own department, e.g. "FP&A") or
+    # "Full Organisation" for an org-wide role (C&B, CFO, CHRO, …). Drives
+    # the "Dashboard for X" header on the frontend.
+    scope_label: str
+
     # 1. Beginning base cost
     beginning_base_cost: Decimal
     beginning_headcount: int

@@ -60,13 +60,14 @@ class AccessState(enum.StrEnum):
 # Layer 4 output — the SLM's only structured decision
 # ---------------------------------------------------------------------------
 class Classification(BaseModel):
-    """Schema-constrained classifier output (Layer 4).
+    """Classifier output (Layer 4).
 
-    This is the exact JSON shape the SLM is forced to emit via Ollama's
-    grammar-constrained ``format``. It carries the intent plus the only
-    free-text slots the model must read: a comparison/secondary target
-    name and the analytics grouping. Everything else (subject id, fiscal
-    year) the pipeline supplies deterministically.
+    This is the exact JSON shape the model is prompted to emit (see
+    ``intent._CLASSIFY_SCHEMA`` / ``slm.complete_json``). It carries the
+    intent plus the only free-text slots the model must read: a
+    comparison/secondary target name and the analytics grouping.
+    Everything else (subject id, fiscal year) the pipeline supplies
+    deterministically.
     """
 
     intent: IntentType = Field(description="One of the six intent types, or UNKNOWN.")

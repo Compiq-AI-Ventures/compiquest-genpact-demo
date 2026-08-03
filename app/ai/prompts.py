@@ -41,9 +41,9 @@ def _pct_from_bases(current: object, new: object) -> str:
     return "N/A"
 
 
-# Local/small models (Ollama) don't reliably follow "keep your reasoning
-# silent" — they sometimes print the ReAct scaffold itself (e.g.
-# "## Answer ... ## Reasoning (internal only) *Reason:* ... *Act:* ...").
+# Models don't reliably follow "keep your reasoning silent" — they
+# sometimes print the ReAct scaffold itself (e.g. "## Answer ... ##
+# Reasoning (internal only) *Reason:* ... *Act:* ...").
 # This is a deterministic server-side safety net: strip any leaked scaffold
 # so only the final answer ever reaches the user, regardless of whether the
 # model complied with the prompt.

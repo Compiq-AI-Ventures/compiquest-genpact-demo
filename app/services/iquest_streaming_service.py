@@ -1,31 +1,24 @@
 """iQuest AI streaming service.
 
-Single responsibility: bridge the AI backend's streaming API to an
-asyncio-friendly async token generator, build the JVRE rationale prompt,
-and persist the completed text via the rationale repository. SSE framing
-is left to the caller (router) — this module only ever yields raw tokens.
-
-Both backends (Bedrock LLM and Ollama SLM) use the same thread+queue bridge
-pattern: a daemon thread calls the synchronous SDK/HTTP client and puts raw
-chunk bytes onto an asyncio.Queue; the async generator drains the queue
-without ever blocking the event loop.
-
-To switch backends, comment/uncomment the two blocks inside _token_stream.
+Single responsibility: call AWS Bedrock for the JVRE rationale and
+BUDGET/GLOBAL scope Q&A, build the JVRE rationale prompt, and persist the
+completed text via the rationale repository. Bedrock's ``invoke_model`` is
+synchronous (boto3 has no async client), so every call runs in a thread-pool
+executor via ``run_in_executor`` to avoid blocking the event loop. There is
+no true token-by-token stream — the full completion is fetched in one call
+and then chunked into an async generator so the SSE framing in the router
+layer is unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
-import threading
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-import boto3
-import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.prompts import PAY_RATIONALE_SYSTEM, RATIONALE_DOMAIN_CONTEXT, _pct_from_bases
@@ -37,146 +30,11 @@ from app.services.bedrock_client import get_bedrock_client
 logger = logging.getLogger(__name__)
 
 _APP_JSON = "application/json"
+_CHUNK_SIZE = 40
 
 
 # ---------------------------------------------------------------------------
-# Sync stream workers (each runs in a daemon thread)
-# ---------------------------------------------------------------------------
-
-def _run_bedrock_stream(
-    loop: asyncio.AbstractEventLoop,
-    queue: asyncio.Queue[bytes | None],
-    region: str,
-    model_id: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    aws_access_key_id: str | None = None,
-    aws_secret_access_key: str | None = None,
-    aws_session_token: str | None = None,
-) -> None:
-    """Synchronous Bedrock streaming worker — runs in a daemon thread.
-
-    Puts raw chunk bytes onto the asyncio queue; puts the ``None`` sentinel
-    when done (or on error) so the async consumer knows the stream is finished.
-    """
-    client = boto3.client(
-        "bedrock-runtime",
-        region_name=region,
-        aws_access_key_id=aws_access_key_id or None,
-        aws_secret_access_key=aws_secret_access_key or None,
-        aws_session_token=aws_session_token or None,
-    )
-    body = json.dumps({
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    })
-    try:
-        resp = client.invoke_model_with_response_stream(
-            modelId=model_id,
-            body=body,
-            contentType=_APP_JSON,
-            accept=_APP_JSON,
-        )
-        for event in resp["body"]:
-            if "chunk" in event:
-                loop.call_soon_threadsafe(queue.put_nowait, event["chunk"]["bytes"])
-    except Exception:
-        logger.exception("Bedrock stream error for model %s", model_id)
-    finally:
-        loop.call_soon_threadsafe(queue.put_nowait, None)
-
-
-def _run_ollama_stream(
-    loop: asyncio.AbstractEventLoop,
-    queue: asyncio.Queue[bytes | None],
-    base_url: str,
-    model: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    system: str | None = None,
-) -> None:
-    """Synchronous Ollama streaming worker — runs in a daemon thread.
-
-    Mirrors _run_bedrock_stream exactly: puts raw token bytes onto the asyncio
-    queue and sends the None sentinel when done so the consumer loop exits.
-    Requires a local Ollama instance (https://ollama.com). Pull the model
-    first: ``ollama pull <model>``.
-    """
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": True,
-        # Thinking models (e.g. qwen3.5) otherwise burn num_predict on hidden
-        # reasoning and never emit a "response" token. Ignored by models that
-        # don't support it.
-        "think": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-    if system:
-        payload["system"] = system
-    try:
-        with contextlib.ExitStack() as stack:
-            client = stack.enter_context(httpx.Client(base_url=base_url, timeout=120))
-            resp = stack.enter_context(client.stream("POST", "/api/generate", json=payload))
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if data.get("response"):
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, data["response"].encode()
-                    )
-                if data.get("done"):
-                    break
-    except Exception:
-        logger.exception("Ollama stream error for model %s", model)
-    finally:
-        loop.call_soon_threadsafe(queue.put_nowait, None)
-
-
-# ---------------------------------------------------------------------------
-# Chunk decoders
-# ---------------------------------------------------------------------------
-
-def _parse_bedrock_token(chunk_bytes: bytes) -> str:
-    """Extract text delta from one Bedrock streaming chunk.
-
-    Handles native Bedrock Claude format (``content_block_delta``) and the
-    OpenAI-compatible endpoint format (``choices[0].delta.content``).
-    Returns an empty string for chunks that carry no text (e.g. start/stop
-    events) so callers can filter with a simple truthiness check.
-    """
-    try:
-        data = json.loads(chunk_bytes)
-        if data.get("type") == "content_block_delta":
-            return data.get("delta", {}).get("text") or ""
-        return (data.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
-    except (json.JSONDecodeError, KeyError, IndexError):
-        return ""
-
-
-def _parse_ollama_token(chunk_bytes: bytes) -> str:
-    """Decode a raw Ollama token put by _run_ollama_stream."""
-    return chunk_bytes.decode("utf-8", errors="replace")
-
-
-# ---------------------------------------------------------------------------
-# Prompt builder
-# ---------------------------------------------------------------------------
-
-def _fmt(val: object, prefix: str = "", suffix: str = "") -> str:
-    """Format a nullable value with optional pre/suffix; returns 'N/A' for None."""
-    return f"{prefix}{val}{suffix}" if val is not None else "N/A"
-
-
-# ---------------------------------------------------------------------------
-# Bedrock helpers (also used by iquest_ai_router for non-streaming calls)
+# Bedrock helpers
 # ---------------------------------------------------------------------------
 
 def invoke_bedrock_sync(
@@ -204,69 +62,32 @@ def invoke_llm_sync(
     max_tokens: int = 400,
     temperature: float = 0.4,
 ) -> str:
-    """Synchronous, non-streaming LLM call — used for suggested-question generation.
-
-    To switch backends: comment out the active block below and uncomment the
-    other, mirroring the pattern in ``_token_stream``. Restart the server —
-    no other changes needed.
+    """Synchronous, non-streaming LLM call — used for suggested-question
+    generation and the P&L/C&B executive-summary bullets.
     """
-    # --- LLM: AWS Bedrock ---
-    # return invoke_bedrock_sync(settings, messages, max_tokens, temperature)
-
-    # --- SLM: Ollama (local) — comment out Bedrock block above, uncomment below ---
-    prompt = messages[-1]["content"] if messages else ""
-    with httpx.Client(base_url=settings.ollama_base_url, timeout=120) as client:
-        resp = client.post("/api/generate", json={
-            "model": settings.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            # Thinking models (e.g. qwen3.5) otherwise burn num_predict on
-            # hidden reasoning and never emit a "response" token.
-            "think": False,
-            "options": {"temperature": temperature, "num_predict": max_tokens},
-        })
-        return resp.json().get("response", "")
+    return invoke_bedrock_sync(settings, messages, max_tokens, temperature)
 
 
 async def stream_scope_response(settings: Any, prompt: str) -> AsyncIterator[str]:
-    """Async generator that streams tokens for BUDGET/GLOBAL scope Q&A.
+    """Async generator that yields chunked tokens for BUDGET/GLOBAL scope Q&A.
 
-    Routes to Bedrock (chunked sync) or Ollama (native stream) based on
-    ``settings.ai_provider``.
+    Calls Bedrock once (non-streaming) then chunks the result — Bedrock has
+    no true streaming here, this fakes a typewriter effect for the SSE layer.
     """
-    if getattr(settings, "ai_provider", "ollama") == "bedrock":
-        raw = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: invoke_bedrock_sync(
-                settings,
-                [{"role": "user", "content": prompt}],
-                max_tokens=800,
-            ),
-        )
-        chunk_size = 40
-        for i in range(0, len(raw), chunk_size):
-            yield raw[i : i + chunk_size]
-    else:
-        from app.services.compchat import slm
-
-        async for token in slm.stream_generate(
-            settings.ollama_base_url,
-            settings.ollama_model,
-            prompt,
-            temperature=0.3,
+    raw = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: invoke_bedrock_sync(
+            settings,
+            [{"role": "user", "content": prompt}],
             max_tokens=800,
-        ):
-            yield token
+        ),
+    )
+    for i in range(0, len(raw), _CHUNK_SIZE):
+        yield raw[i : i + _CHUNK_SIZE]
 
 
 def build_prompt(eng: IquestEngineOutput) -> tuple[str, str]:
-    """Return (system, user_prompt) for the JVRE rationale request.
-
-    Separating the format rules into the system message improves compliance
-    on local SLMs (Ollama) that treat system vs user content differently.
-    The iquest_context.md knowledge base goes in the user message so it is
-    part of the task framing, not the constraint layer.
-    """
+    """Return (system, user_prompt) for the JVRE rationale request."""
     # Qualitative market position so the narrator never quotes a raw index/ratio.
     try:
         _cr = float(eng.external_cr) if eng.external_cr is not None else None
@@ -331,61 +152,28 @@ Active Signals: Promotion in scope={_fmt(eng.promotion_flag)} | No increase in m
     return PAY_RATIONALE_SYSTEM, user_prompt
 
 
+def _fmt(val: object, prefix: str = "", suffix: str = "") -> str:
+    """Format a nullable value with optional pre/suffix; returns 'N/A' for None."""
+    return f"{prefix}{val}{suffix}" if val is not None else "N/A"
+
+
 # ---------------------------------------------------------------------------
-# Token stream — swap backend here
+# Token stream — one-shot Bedrock call chunked into an async generator
 # ---------------------------------------------------------------------------
 
 async def _token_stream(settings: Settings, system: str, prompt: str) -> AsyncIterator[str]:
-    """Yield decoded text tokens from the active AI backend.
-
-    To switch between LLM (Bedrock) and local SLM (Ollama):
-      1. Comment out the active block below and uncomment the other.
-      2. Restart the server — no other changes needed.
-    """
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-
-    # --- LLM: AWS Bedrock ---
-    # threading.Thread(
-    #     target=_run_bedrock_stream,
-    #     args=(
-    #         loop, queue,
-    #         settings.aws_region,
-    #         settings.bedrock_model_id,
-    #         system + "\n\n" + prompt,  # Bedrock: prepend system to user message
-    #         settings.bedrock_max_tokens,
-    #         settings.bedrock_temperature,
-    #         settings.aws_access_key_id,
-    #         settings.aws_secret_access_key,
-    #         settings.aws_session_token,
-    #     ),
-    #     daemon=True,
-    # ).start()
-    # parse_token = _parse_bedrock_token
-
-    # --- SLM: Ollama (local) — comment out Bedrock block above, uncomment below ---
-    threading.Thread(
-        target=_run_ollama_stream,
-        args=(
-            loop, queue,
-            settings.ollama_base_url,
-            settings.ollama_model,
-            prompt,
-            settings.bedrock_max_tokens,
-            settings.bedrock_temperature,
-            system,
+    """Yield chunked text tokens from a single Bedrock completion."""
+    raw = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: invoke_bedrock_sync(
+            settings,
+            [{"role": "user", "content": system + "\n\n" + prompt}],
+            max_tokens=settings.bedrock_max_tokens,
+            temperature=settings.bedrock_temperature,
         ),
-        daemon=True,
-    ).start()
-    parse_token = _parse_ollama_token
-
-    while True:
-        chunk_bytes = await queue.get()
-        if chunk_bytes is None:
-            break
-        token = parse_token(chunk_bytes)
-        if token:
-            yield token
+    )
+    for i in range(0, len(raw), _CHUNK_SIZE):
+        yield raw[i : i + _CHUNK_SIZE]
 
 
 # ---------------------------------------------------------------------------
@@ -400,12 +188,7 @@ async def stream_pay_rationale_tokens(
     eng: IquestEngineOutput,
     settings: Settings,
 ) -> AsyncIterator[str]:
-    """Yield raw rationale text tokens, then persist the completed rationale.
-
-    The active backend is selected by the commented/uncommented blocks in
-    ``_token_stream``. SSE framing is the caller's responsibility (see
-    ``stream_scope_response`` for the same convention).
-    """
+    """Yield raw rationale text tokens, then persist the completed rationale."""
     tokens: list[str] = []
     system, user_prompt = build_prompt(eng)
     async for token in _token_stream(settings, system, user_prompt):

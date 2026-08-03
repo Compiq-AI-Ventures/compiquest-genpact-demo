@@ -1583,8 +1583,12 @@ async def align_lines_with_jvre(
             if alloc.budget_for_allocation > 0
             else Decimal("0")
         )
-        base, variable = _split_cash(max(cash - reserve, Decimal("0")))
-        allocated = base + variable + reserve + lti
+        # `allocated_amount` must never fall below the recipient's JVRE
+        # recommendation (which is itself >= their current pay) — the manager's
+        # pool is sized with headroom above the JVRE total precisely so pay
+        # never has to be cut to fit. `reserve` is tracked for display only.
+        base, variable = _split_cash(cash)
+        allocated = base + variable + lti
 
         line = existing_by_recipient.get(report_id)
         if line is None:
@@ -1723,9 +1727,9 @@ async def refresh_line_to_jvre(
         if alloc.budget_for_allocation > 0
         else Decimal("0")
     )
-    base, variable = _split_cash(max(cash - reserve, Decimal("0")))
-
-    line.allocated_amount = base + variable + reserve + lti
+    # See align_lines_with_jvre for why `reserve` isn't subtracted here.
+    base, variable = _split_cash(cash)
+    line.allocated_amount = base + variable + lti
     line.base_pool = base
     line.variable_pool = variable
     line.lti_grant_fmv_pool = lti
@@ -1793,15 +1797,20 @@ async def submit_budget_allocation(
         )
         if existing_child is not None:
             continue
-        mop_reserve = (line.allocated_amount * Decimal("0.06")).quantize(Decimal("0.01"))
+        # The child's budget_for_allocation must cover their own subtree's
+        # JVRE recommendation (== what they just received) with headroom,
+        # never less — so we size it at 5% above what was handed down and
+        # add the strategic reserve on top, rather than carving it out.
+        mop_budget_for_allocation = (line.allocated_amount * Decimal("1.05")).quantize(Decimal("0.01"))
+        mop_reserve = (mop_budget_for_allocation * Decimal("0.06")).quantize(Decimal("0.01"))
         child = BudgetAllocation(
             tenant_id=tenant_id,
             cycle_id=alloc.cycle_id,
             owner_user_id=line.recipient_user_id,
             parent_allocation_id=alloc.id,
-            total_pool=line.allocated_amount,
+            total_pool=mop_budget_for_allocation + mop_reserve,
             strategic_reserve=mop_reserve,
-            budget_for_allocation=line.allocated_amount - mop_reserve,
+            budget_for_allocation=mop_budget_for_allocation,
             currency_code=line.currency_code,
             status=BudgetAllocationStatus.PENDING.value,
         )

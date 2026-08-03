@@ -6,9 +6,9 @@ Two endpoints:
                                   11-layer pipeline (see app.services.compchat)
 
 ``/suggested-questions`` calls ``iquest_streaming_service.invoke_llm_sync`` for
-pill generation — backend (Bedrock/Ollama) is switched there, not here.
+pill generation via AWS Bedrock.
 ``/iquest-query`` no longer dumps the whole record into a prompt — it runs
-the grounded, RBAC-gated, deterministic-tool CompChat pipeline so the SLM
+the grounded, RBAC-gated, deterministic-tool CompChat pipeline so the model
 narrates only pre-validated facts and never invents numbers.
 """
 

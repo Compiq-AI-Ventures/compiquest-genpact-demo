@@ -68,8 +68,8 @@ class Settings(BaseSettings):
     # across replicas, so production deployments MUST set this.
     redis_url: str | None = None
 
-    # --- AWS Bedrock / iQuest AI ----------------------------------------
-    # Region and model for the JVRE rationale streaming endpoint.
+    # --- AWS Bedrock (the only LLM backend — iQuest, CompChat, CD&A) ----
+    # Single model id used for every LLM call site in the app.
     # Credentials can be provided here (loaded from .env) or via the
     # standard AWS chain (~/.aws/credentials, instance profile, etc.).
     # When set here they take explicit precedence over the ambient chain.
@@ -78,49 +78,24 @@ class Settings(BaseSettings):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     aws_session_token: str | None = None
-    # Max tokens and temperature for the JVRE rationale generation prompt.
+    # Default max tokens / temperature for Bedrock completions; call
+    # sites may override per-request.
     bedrock_max_tokens: int = 350
     bedrock_temperature: float = 0.3
 
-    # --- Ollama / local SLM ---------------------------------------------
-    # Used when the Ollama block is active in iquest_streaming_service._token_stream.
-    # Switch backends by commenting/uncommenting that block; no env var needed.
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.1:latest"
-
-    # --- AI Chat provider -----------------------------------------------
-    # Controls which LLM backend the new iQuest AI Chat agent uses.
-    # "ollama" → OllamaLLMClient (local dev)
-    # "bedrock" → BedrockLLMClient with DeepSeek (prod)
-    ai_provider: str = "ollama"
-
     # --- CompChat (compensation chat assistant pipeline) ----------------
-    # Model used for the Layer-4 intent classifier and the narrator. Kept
-    # separate from ``ollama_model`` so the chat pipeline can run a model
-    # with stronger JSON/instruction discipline than the rationale
-    # endpoint's model. gpt-oss:120b-cloud (Ollama's cloud-offloaded
-    # variant — the weights don't fit local VRAM) replaced llama3.1:latest
-    # after it proved unreliable at exact-digit narration of large numbers
-    # (see budget_headroom follow-up questions: correct ~50% of the time,
-    # garbled digit-grouping or false "insufficient information" declines
-    # the rest, despite the fact being present and grounded in context).
-    compchat_model: str = "gpt-oss:120b-cloud"
     # Fallback fiscal year when neither the question nor the Tessot data
     # implies one. Tessot master data is anchored to FY2026.
     compchat_default_fiscal_year: int = 2026
 
     # --- CD&A report generator (Compensation Discussion & Analysis) -----
-    # Local model used to narrate the CD&A report's data-driven sections.
-    # Runs through the same Ollama endpoint (``ollama_base_url``). Numbers
-    # are always deterministic (parsed from the uploaded workbook); the
-    # model only writes connective prose grounded in those numbers plus the
-    # bundled domain knowledge base — it never authors a figure. Defaults to
-    # ``qwen3.5:9b`` (the tag pulled locally). Override with ``CDA_MODEL`` if
-    # you pull a different tag. If the model is unreachable the generator
-    # falls back to a deterministic narrative, so a running Ollama is
-    # optional for the endpoint to succeed.
-    cda_model: str = "qwen3.5:9b"
-    # Ceiling on narration length per section (num_predict).
+    # Bedrock (``bedrock_model_id``) narrates the CD&A report's
+    # data-driven sections. Numbers are always deterministic (parsed from
+    # the uploaded workbook); the model only writes connective prose
+    # grounded in those numbers plus the bundled domain knowledge base —
+    # it never authors a figure. If Bedrock is unreachable the generator
+    # falls back to a deterministic narrative.
+    # Ceiling on narration length per section.
     cda_max_tokens: int = 500
     cda_temperature: float = 0.2
 

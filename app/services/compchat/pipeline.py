@@ -5,7 +5,7 @@ Two public coroutines:
 * :func:`prepare` — runs Layers 2-7 (RBAC, resolver, intent, tools,
   context) and returns a :class:`PipelineResult` carrying either a
   narration prompt (happy path) or a ``terminal_message`` (hard stop).
-* :func:`narrate` — Layers 8-11: buffers the SLM narration, runs the
+* :func:`narrate` — Layers 8-11: buffers the LLM narration, runs the
   numeric grounding check, then yields SSE token strings (the verified
   answer or a structured block message), and writes the audit trace.
 
@@ -72,9 +72,7 @@ async def prepare(
     trace_id = uuid.uuid4().hex
 
     # --- Layer 4: intent ---
-    cls: Classification = await intent_classifier.classify(
-        settings.ollama_base_url, settings.compchat_model, question
-    )
+    cls: Classification = await intent_classifier.classify(settings, question)
     # A follow-up with no intent of its own (a correction, "why?") inherits
     # the topic of the conversation rather than dropping to out-of-scope.
     if cls.intent is IntentType.UNKNOWN and history:
@@ -366,8 +364,7 @@ async def narrate(
     buffer_parts: list[str] = []
     try:
         async for token in slm.stream_generate(
-            settings.ollama_base_url,
-            settings.compchat_model,
+            settings,
             result.narration_prompt or "",
             temperature=settings.bedrock_temperature,
         ):
@@ -379,17 +376,17 @@ async def narrate(
             {
                 "step": 3,
                 "name": "narration",
-                "layer": "8 — SLM narrate (buffered)",
-                "summary": "The SLM call failed (transport/timeout); fell back to a structured 'data unavailable' message.",
+                "layer": "8 — LLM narrate (buffered)",
+                "summary": "The LLM call failed (transport/timeout); fell back to a structured 'data unavailable' message.",
                 "generated": False,
-                "error": "slm_narration_failed",
+                "error": "llm_narration_failed",
             }
         )
         yield prompts.data_unavailable()
         await _audit(db, ctx, result)
         return
 
-    # Local SLMs don't always keep the ReAct scratchpad silent — strip any
+    # The model doesn't always keep the ReAct scratchpad silent — strip any
     # leaked "## Answer / ## Reasoning" or "*Reason:* ... *Answer:*" scaffold
     # before it's validated or shown to the manager.
     answer = strip_react_scaffold("".join(buffer_parts).strip())
@@ -400,18 +397,18 @@ async def narrate(
     if result.rationale_text:
         grounding["_rationale"] = result.rationale_text
 
-    # --- Trace step 3: the SLM narration produced from the grounding token ---
+    # --- Trace step 3: the LLM narration produced from the grounding token ---
     result.agent_trace.append(
         {
             "step": 3,
             "name": "narration",
-            "layer": "8 — SLM narrate (buffered)",
+            "layer": "8 — LLM narrate (buffered)",
             "summary": (
-                f"The SLM ({settings.compchat_model}) rephrased the grounding token into a "
+                f"The LLM ({settings.bedrock_model_id}) rephrased the grounding token into a "
                 f"{len(answer)}-char answer. It only narrates — it cannot fetch or compute; "
                 f"its numbers are claims to be verified next, not trusted facts."
             ),
-            "model": settings.compchat_model,
+            "model": settings.bedrock_model_id,
             "generated": bool(answer),
             "answer_chars": len(answer),
             "answer_preview": answer[:500],

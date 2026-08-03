@@ -79,6 +79,7 @@ docs/
 # API_DOCUMENTATION.md, docs/specs/**) are unaffected — gitignore never
 # untracks files git already tracks.
 *.md
+!DEPLOYMENT.md
 *.xlsx
 
 # Load-test CSV output. Commit only the canonical baseline (see

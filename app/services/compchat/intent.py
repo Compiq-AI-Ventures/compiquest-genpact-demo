@@ -9,9 +9,11 @@ Reliability stack:
 
 1. **Rules-first fast path** — unambiguous keyword hits classify with
    zero model cost and 100% determinism.
-2. **Schema-constrained SLM** — for everything else, Ollama is forced
-   (via ``format`` grammar) to emit exactly the :class:`Classification`
-   shape with an enum-bounded ``intent``.
+2. **Prompt-enforced JSON via Bedrock** — for everything else, the model
+   is instructed to emit exactly the :class:`Classification` shape with
+   an enum-bounded ``intent``. Bedrock's raw ``InvokeModel`` API has no
+   grammar-constrained decoding, so conformance relies on the prompt plus
+   the Pydantic validation in step 3, not a forced grammar.
 3. **Repair / fallback** — parse into Pydantic; on any failure drop back
    to the rules result, and if that is UNKNOWN return UNKNOWN (a
    structured "cannot answer", never a guess).
@@ -54,7 +56,7 @@ _RULES: tuple[tuple[IntentType, tuple[str, ...]], ...] = (
     )),
 )
 
-# JSON Schema handed to Ollama's grammar-constrained ``format``.
+# JSON Schema enforced via prompt instructions (see slm.complete_json).
 _CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -115,9 +117,7 @@ def fallback_from_history(prior_user_messages: list[str]) -> IntentType:
     return IntentType.UNKNOWN
 
 
-async def classify(
-    base_url: str, model: str, question: str
-) -> Classification:
+async def classify(settings: object, question: str) -> Classification:
     """Classify ``question`` into a :class:`Classification`."""
     rules_intent = _rules_classify(question)
 
@@ -134,7 +134,7 @@ async def classify(
 
     prompt = f'{_FEWSHOT}\n\nQ: "{question.strip()}" ->'
     try:
-        raw = await slm.complete_json(base_url, model, prompt, _CLASSIFY_SCHEMA)
+        raw = await slm.complete_json(settings, prompt, _CLASSIFY_SCHEMA)
         parsed = Classification.model_validate(raw)
     except Exception:
         logger.warning("compchat.classify SLM path failed; using rules fallback", exc_info=True)

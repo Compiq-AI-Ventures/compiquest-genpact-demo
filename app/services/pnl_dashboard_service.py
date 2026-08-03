@@ -1,8 +1,20 @@
-"""P&L Head Executive Summary — org-wide KPI aggregation.
+"""P&L Head Executive Summary — role-aware KPI aggregation.
 
-Org-wide, not BU-scoped: every PNL_HEAD caller sees the same figures.
-No manager/subtree scoping — much simpler than the MoM/Manager services
-in ``jvre_workspace_service.py``.
+Two callers, same layout, different scopes:
+
+* ``PNL_HEAD`` — sees the KPIs filtered to their own business unit
+  (derived from the caller's ``users.department_id → departments.name``
+  and matched against ``genpact_employee_master.business_unit``).
+* Org-wide roles (``C_AND_B``, ``CFO``, ``CHRO``, …) — no BU filter,
+  the same aggregate view they've always had.
+
+The service takes an optional ``business_unit`` parameter and applies
+it consistently to every derived KPI. Supplied constants (backfill
+cost, net-new cost, leadership retention, effective increment, wage
+inflation) come from a spreadsheet we don't yet derive — for a
+BU-scoped view they're pro-rated by the BU's active-headcount share
+of the org, which is rough but keeps the demo numbers proportional
+rather than showing the same figure at both scopes.
 
 The dashboard measures FY2025 actuals against FY2024, and projects
 FY2026. The KPI definitions (agreed with the finance team):
@@ -77,12 +89,11 @@ _SUPPLIED_LEADERSHIP_RETENTION_PCT = 90.8
 _SUPPLIED_EFFECTIVE_INCREMENT_PCT = 11.22
 _SUPPLIED_WAGE_INFLATION_PCT = 11.19
 
-# A real prompt takes the local Ollama SLM ~6-7s — leave headroom before
-# falling back to the deterministic template.
+# Leave headroom before falling back to the deterministic template.
 _BULLETS_LLM_TIMEOUT_SECONDS = 15.0
 
 # Bullets are cached per-tenant per-facts-hash so repeat dashboard loads don't
-# re-pay SLM latency, but the cache is TTL-bound so the wording stays fresh
+# re-pay LLM latency, but the cache is TTL-bound so the wording stays fresh
 # rather than freezing on the first-ever generation.
 _BULLETS_CACHE_TTL_SECONDS = 600.0
 _bullets_cache: dict[tuple[uuid.UUID, str], tuple[list[str], float]] = {}
@@ -116,25 +127,42 @@ def _facts_cache_key(tenant_id: uuid.UUID, facts: dict[str, str]) -> tuple[uuid.
 # Orchestration
 # ---------------------------------------------------------------------------
 async def get_executive_summary(
-    db: AsyncSession, tenant_id: uuid.UUID
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    business_unit: str | None = None,
 ) -> PnlExecutiveSummaryResponse:
+    """Compute the Executive Summary. Pass ``business_unit`` to scope every
+    KPI to a single BU; leave ``None`` for the org-wide view."""
+
     # 1. Beginning base cost + headcount, this FY and last.
-    base_cost, headcount = await _base_cost(db, tenant_id, _CURRENT_FY)
-    base_cost_prev, _ = await _base_cost(db, tenant_id, _PREV_FY)
+    base_cost, headcount = await _base_cost(db, tenant_id, _CURRENT_FY, business_unit)
+    base_cost_prev, _ = await _base_cost(db, tenant_id, _PREV_FY, business_unit)
     base_cost_delta = base_cost - base_cost_prev
     base_cost_delta_pct = (
         float(base_cost_delta / base_cost_prev * 100) if base_cost_prev else 0.0
     )
 
     # 2. Increment.
-    increment_pct, increment_amount = await _increment(db, tenant_id, _CURRENT_FY)
+    increment_pct, increment_amount = await _increment(
+        db, tenant_id, _CURRENT_FY, business_unit
+    )
 
     # 3. New hires. Counts are derived; the cost split is supplied.
-    new_hire_count = await _new_hire_count(db, tenant_id, _CURRENT_FY)
-    backfill_count = await _backfill_count(db, tenant_id, _CURRENT_FY)
+    new_hire_count = await _new_hire_count(db, tenant_id, _CURRENT_FY, business_unit)
+    backfill_count = await _backfill_count(db, tenant_id, _CURRENT_FY, business_unit)
     net_new_hire_count = max(new_hire_count - backfill_count, 0)
-    backfill_cost = _SUPPLIED_BACKFILL_COST
-    net_new_hire_cost = _SUPPLIED_NET_NEW_HIRE_COST
+
+    # Supplied numbers come from the finance team's model for the whole org.
+    # When we're scoped to a BU we pro-rate the dollar figures by the BU's
+    # headcount share so the demo values stay proportional; rates (retention
+    # %, increment %, wage inflation %) are ratios so they don't scale.
+    bu_share = (
+        await _headcount_share(db, tenant_id, _CURRENT_FY, business_unit)
+        if business_unit
+        else 1.0
+    )
+    backfill_cost = _SUPPLIED_BACKFILL_COST * Decimal(str(bu_share))
+    net_new_hire_cost = _SUPPLIED_NET_NEW_HIRE_COST * Decimal(str(bu_share))
     new_hire_total_cost = backfill_cost + net_new_hire_cost
 
     # 4. Projected new base = beginning base + new hire total + increment.
@@ -142,16 +170,19 @@ async def get_executive_summary(
     projected_headcount = headcount + net_new_hire_count
 
     # 5. Attrition, this FY vs last.
-    attrition_rate = await _attrition_rate(db, tenant_id, _CURRENT_FY)
-    attrition_rate_prev = await _attrition_rate(db, tenant_id, _PREV_FY)
+    attrition_rate = await _attrition_rate(db, tenant_id, _CURRENT_FY, business_unit)
+    attrition_rate_prev = await _attrition_rate(db, tenant_id, _PREV_FY, business_unit)
 
     # 7. New hire median cost.
-    median_cost = await _new_hire_median_cost(db, tenant_id, _CURRENT_FY)
+    median_cost = await _new_hire_median_cost(db, tenant_id, _CURRENT_FY, business_unit)
+
+    scope_label = business_unit if business_unit else "Full Organisation"
 
     summary = PnlExecutiveSummaryResponse(
         fy_label=f"FY{_CURRENT_FY}",
         prev_fy_label=f"FY{_PREV_FY}",
         projected_fy_label=f"FY{_PROJECTED_FY}",
+        scope_label=scope_label,
         beginning_base_cost=base_cost,
         beginning_headcount=headcount,
         beginning_base_cost_prev=base_cost_prev,
@@ -186,10 +217,14 @@ async def get_executive_summary(
 # 1. Beginning base cost
 # ---------------------------------------------------------------------------
 async def _base_cost(
-    db: AsyncSession, tenant_id: uuid.UUID, fy: str
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    fy: str,
+    business_unit: str | None,
 ) -> tuple[Decimal, int]:
     """Sum of ACTIVE employees' pre-increment base salary (USD), plus the
     active headcount that produced it."""
+    bu_clause, params = _bu_filter("e", business_unit)
     row = (
         await db.execute(
             sql_text(
@@ -202,20 +237,57 @@ async def _base_cost(
                     count(*) FILTER (WHERE e.status = 'ACTIVE')
                 FROM genpact_employee_master e
                 {_FX_JOIN}
-                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy
+                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy {bu_clause}
                 """
             ),
-            {"tenant_id": str(tenant_id), "fy": fy},
+            {"tenant_id": str(tenant_id), "fy": fy, **params},
         )
     ).one()
     return Decimal(str(row[0])), int(row[1])
+
+
+def _bu_filter(alias: str, business_unit: str | None) -> tuple[str, dict[str, str]]:
+    """Compose the ``AND alias.business_unit = :bu`` clause + its parameters.
+
+    Returns an empty clause when ``business_unit`` is None so the same
+    query works for both org-wide and BU-scoped callers.
+    """
+    if not business_unit:
+        return "", {}
+    return f"AND {alias}.business_unit = :business_unit", {"business_unit": business_unit}
+
+
+async def _headcount_share(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str, business_unit: str
+) -> float:
+    """Fraction of the org's active headcount that sits in this BU. Used to
+    pro-rate the supplied dollar figures for the BU-scoped view."""
+    row = (
+        await db.execute(
+            sql_text(
+                """
+                SELECT
+                    count(*) FILTER (WHERE status='ACTIVE' AND business_unit=:business_unit),
+                    count(*) FILTER (WHERE status='ACTIVE')
+                FROM genpact_employee_master
+                WHERE tenant_id = :tenant_id AND fiscal_year = :fy
+                """
+            ),
+            {"tenant_id": str(tenant_id), "fy": fy, "business_unit": business_unit},
+        )
+    ).one()
+    bu_hc, total_hc = int(row[0]), int(row[1])
+    return bu_hc / total_hc if total_hc else 0.0
 
 
 # ---------------------------------------------------------------------------
 # 2. Increment
 # ---------------------------------------------------------------------------
 async def _increment(
-    db: AsyncSession, tenant_id: uuid.UUID, fy: str
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    fy: str,
+    business_unit: str | None,
 ) -> tuple[float, Decimal]:
     """Average base increment % and the same spend in USD.
 
@@ -224,6 +296,7 @@ async def _increment(
     average down to roughly half the awarded rate. The dollar figure is
     the true post-minus-pre delta across everyone, so it needs no filter.
     """
+    bu_clause, params = _bu_filter("e", business_unit)
     row = (
         await db.execute(
             sql_text(
@@ -236,10 +309,10 @@ async def _increment(
                     ), 0)
                 FROM genpact_employee_master e
                 {_FX_JOIN}
-                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy
+                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy {bu_clause}
                 """
             ),
-            {"tenant_id": str(tenant_id), "fy": fy},
+            {"tenant_id": str(tenant_id), "fy": fy, **params},
         )
     ).one()
     return float(row[0]), Decimal(str(row[1]))
@@ -248,47 +321,68 @@ async def _increment(
 # ---------------------------------------------------------------------------
 # 3. New hires
 # ---------------------------------------------------------------------------
-async def _new_hire_count(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> int:
+async def _new_hire_count(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str, business_unit: str | None
+) -> int:
     """Everyone who joined during the fiscal year (backfills + net new)."""
     fy_start, fy_end = _fy_bounds(fy)
+    bu_clause, bu_params = _bu_filter("e", business_unit)
     count = (
         await db.execute(
             sql_text(
-                """
+                f"""
                 SELECT count(*)
                 FROM genpact_employee_master e
                 WHERE e.tenant_id = :tenant_id
                   AND e.fiscal_year = :fy
                   AND e.joining_date >= :fy_start
                   AND e.joining_date <  :fy_end
+                  {bu_clause}
                 """
             ),
-            {"tenant_id": str(tenant_id), "fy": fy, "fy_start": fy_start, "fy_end": fy_end},
+            {
+                "tenant_id": str(tenant_id),
+                "fy": fy,
+                "fy_start": fy_start,
+                "fy_end": fy_end,
+                **bu_params,
+            },
         )
     ).scalar_one()
     return int(count)
 
 
-async def _backfill_count(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> int:
+async def _backfill_count(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str, business_unit: str | None
+) -> int:
     """Replacement hires who started during the fiscal year.
 
     Only ``Accepted`` offers count — Declined/Rescinded postings never
     produced a hire, so they carry no backfill.
     """
     fy_start, fy_end = _fy_bounds(fy)
+    # genpact_job_posting has its own business_unit column, so we scope
+    # against that directly rather than joining through the leaver.
+    bu_clause, bu_params = _bu_filter("jp", business_unit)
     count = (
         await db.execute(
             sql_text(
-                """
+                f"""
                 SELECT count(*)
                 FROM genpact_job_posting jp
                 WHERE jp.tenant_id = :tenant_id
                   AND jp.offer_outcome = 'Accepted'
                   AND jp.date_of_joining_replacement >= :fy_start
                   AND jp.date_of_joining_replacement <  :fy_end
+                  {bu_clause}
                 """
             ),
-            {"tenant_id": str(tenant_id), "fy_start": fy_start, "fy_end": fy_end},
+            {
+                "tenant_id": str(tenant_id),
+                "fy_start": fy_start,
+                "fy_end": fy_end,
+                **bu_params,
+            },
         )
     ).scalar_one()
     return int(count)
@@ -297,18 +391,21 @@ async def _backfill_count(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> in
 # ---------------------------------------------------------------------------
 # 5. Attrition
 # ---------------------------------------------------------------------------
-async def _attrition_rate(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> float:
+async def _attrition_rate(
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str, business_unit: str | None
+) -> float:
     """Leavers as a percentage of total headcount for the fiscal year."""
+    bu_clause, bu_params = _bu_filter("e", business_unit)
     row = (
         await db.execute(
             sql_text(
-                """
+                f"""
                 SELECT count(*) FILTER (WHERE e.status = 'INACTIVE'), count(*)
                 FROM genpact_employee_master e
-                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy
+                WHERE e.tenant_id = :tenant_id AND e.fiscal_year = :fy {bu_clause}
                 """
             ),
-            {"tenant_id": str(tenant_id), "fy": fy},
+            {"tenant_id": str(tenant_id), "fy": fy, **bu_params},
         )
     ).one()
     leavers, total = int(row[0]), int(row[1])
@@ -319,7 +416,7 @@ async def _attrition_rate(db: AsyncSession, tenant_id: uuid.UUID, fy: str) -> fl
 # 7. New hire median cost
 # ---------------------------------------------------------------------------
 async def _new_hire_median_cost(
-    db: AsyncSession, tenant_id: uuid.UUID, fy: str
+    db: AsyncSession, tenant_id: uuid.UUID, fy: str, business_unit: str | None
 ) -> Decimal:
     """Median incoming-minus-outgoing base pay (USD) across the FY's backfills.
 
@@ -329,10 +426,11 @@ async def _new_hire_median_cost(
     exited in an earlier fiscal year than the replacement's start date.
     """
     fy_start, fy_end = _fy_bounds(fy)
+    bu_clause, bu_params = _bu_filter("jp", business_unit)
     value = (
         await db.execute(
             sql_text(
-                """
+                f"""
                 WITH leaver_fx AS (
                     SELECT DISTINCT ON (employee_id) employee_id, currency, fiscal_year
                     FROM genpact_employee_master
@@ -352,9 +450,15 @@ async def _new_hire_median_cost(
                   AND jp.offer_outcome = 'Accepted'
                   AND jp.date_of_joining_replacement >= :fy_start
                   AND jp.date_of_joining_replacement <  :fy_end
+                  {bu_clause}
                 """
             ),
-            {"tenant_id": str(tenant_id), "fy_start": fy_start, "fy_end": fy_end},
+            {
+                "tenant_id": str(tenant_id),
+                "fy_start": fy_start,
+                "fy_end": fy_end,
+                **bu_params,
+            },
         )
     ).scalar_one()
     return Decimal(str(value or 0))

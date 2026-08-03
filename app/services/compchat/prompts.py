@@ -73,7 +73,7 @@ def build_narration_prompt(
     rationale_text: str | None,
     history: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Assemble the full single-prompt narration input for Ollama.
+    """Assemble the full single-prompt narration input for the LLM.
 
     ``history`` is the recent (role, content) turns before this question,
     so the narrator can resolve follow-ups and corrections ("that's the
